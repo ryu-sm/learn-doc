@@ -1,4 +1,4 @@
-
+python -c "from openpyxl import load_workbook; from collections import Counter; w=load_workbook('input_dependency_report.xlsx',read_only=True,data_only=True); s=w['Unresolved_References']; c=Counter(r[3] for r in list(s.values)[1:]); print(*c.most_common(),sep='\n')"
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
