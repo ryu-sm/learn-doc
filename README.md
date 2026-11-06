@@ -827,3 +827,96 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+import re
+import sys
+from pathlib import Path
+
+from openpyxl import load_workbook
+from oletools.olevba import VBA_Parser
+
+
+def diagnose(file_path):
+    path = Path(file_path)
+
+    wb = load_workbook(
+        path,
+        read_only=False,
+        data_only=False,
+        keep_vba=True
+    )
+
+    print("\n========== SHEETS ==========")
+
+    for ws in wb.worksheets:
+        print(
+            f"Name: {ws.title} | "
+            f"CodeName: {ws.sheet_properties.codeName}"
+        )
+
+    print("\n========== VBA MODULES ==========")
+
+    parser = VBA_Parser(str(path))
+
+    patterns = {
+        "Worksheets/Sheets":
+            r"\b(?:Worksheets|Sheets)\s*\(",
+        "CodeName":
+            r"\bSheet\d+\s*\.",
+        "Set Worksheet":
+            r"\bSet\s+\w+\s*=",
+        "Range":
+            r"\bRange\s*\(",
+        "Cells":
+            r"\bCells\s*\(",
+        "Copy":
+            r"\.Copy\b",
+        "Paste":
+            r"\bPaste(?:Special)?\b",
+        "With":
+            r"\bWith\b",
+        "ActiveSheet":
+            r"\bActiveSheet\b",
+    }
+
+    try:
+        has_macros = parser.detect_vba_macros()
+        print("VBA detected:", has_macros)
+
+        if has_macros:
+            for _, _, module, code in parser.extract_macros():
+
+                print(f"\nModule: {module}")
+                print(f"Code length: {len(code)}")
+
+                for name, pattern in patterns.items():
+                    matches = re.findall(
+                        pattern, code, re.I
+                    )
+                    print(
+                        f"  {name}: {len(matches)}"
+                    )
+
+                print("  --- Code preview ---")
+                print(code[:1500])
+
+    finally:
+        parser.close()
+        wb.close()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print(
+            "Usage: python3 diagnose_xlsm.py file.xlsm"
+        )
+        sys.exit(1)
+
+    diagnose(sys.argv[1])
+
