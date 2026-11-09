@@ -1,1166 +1,1190 @@
 
-Option Explicit
-
-' ============================================================
-' XLSM Dependency Analyzer
-' Version: 3.0
-'
-' Matrix direction:
-' Row = Source Sheet
-' Column = Referenced / Destination Sheet
-'
-' No source workbook modification.
-' No source macros executed.
-' ============================================================
+import argparse
+import re
+import sys
+import zipfile
+import posixpath
+from pathlib import Path
+from collections import Counter, defaultdict
+from xml.etree import ElementTree as ET
+
+from openpyxl import load_workbook, Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils.cell import range_boundaries, get_column_letter
+
+try:
+    from oletools.olevba import VBA_Parser
+except ImportError:
+    VBA_Parser = None
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+MAX_EXPRESSION_LENGTH = 32000
+MAX_RECURSION = 12
+MAX_EVIDENCE = 500000
+
+SHEET_REF_RE = re.compile(
+    r"(?:'((?:[^']|'')+)'|"
+    r"([\w\u0080-\uffff.]+))!",
+    re.UNICODE
+)
+
+CELL_REF_RE = re.compile(
+    r"^\$?([A-Z]{1,3})\$?(\d+)$",
+    re.I
+)
+
+VBA_SHEET_RE = re.compile(
+    r'(?:Sheets|Worksheets)\s*\(\s*"([^"]+)"\s*\)',
+    re.I
+)
+
+VBA_PROC_RE = re.compile(
+    r'(?im)^\s*(?:(?:Public|Private|Friend|Static)\s+)*'
+    r'(?:Sub|Function)\s+([A-Za-z_]\w*)\s*\('
+)
+
+VBA_CALL_RE = re.compile(
+    r'(?im)^\s*(?:Call\s+)?([A-Za-z_]\w*)\b'
+)
+
+FUNC_RE = re.compile(r'\b(INDIRECT|OFFSET|INDEX)\s*\(', re.I)
+
+STRING_RE = re.compile(r'"(?:[^"]|"")*"')
+
+NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+NS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+NS_PKG = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+
+# ============================================================
+# BASIC UTILITIES
+# ============================================================
 
-Private gWB As Workbook
-Private gReport As Workbook
+def norm_name(value):
+    if value is None:
+        return ""
+    return str(value).strip().strip("'").replace("''", "'")
 
-Private gSheets As Object
-Private gData As Object
-Private gNav As Object
-Private gEvidence As Collection
-Private gUnresolved As Collection
 
-Private gProcedures As Object
-Private gMacroTargets As Object
+def split_top_level(expr, delimiter=","):
+    result = []
+    buf = []
+    depth = 0
+    quoted = False
+    i = 0
 
-Private gStage As String
-Private gCurrentSheet As String
-Private gCurrentCell As String
+    while i < len(expr):
+        ch = expr[i]
 
-Private gFormulaCount As Long
-Private gIndirectCount As Long
-Private gShapeCount As Long
-
-' ============================================================
-' ENTRY POINT
-' ============================================================
+        if ch == '"':
+            if quoted and i + 1 < len(expr) and expr[i + 1] == '"':
+                buf.append('""')
+                i += 2
+                continue
+            quoted = not quoted
 
-Public Sub AnalyzeXlsmDependencies()
+        elif not quoted:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            elif ch == delimiter and depth == 0:
+                result.append("".join(buf).strip())
+                buf = []
+                i += 1
+                continue
 
-    Dim selectedFile As Variant
-    Dim outputFile As String
-    Dim oldCalculation As XlCalculation
-    Dim oldEvents As Boolean
-    Dim oldScreen As Boolean
-    Dim oldAlerts As Boolean
+        buf.append(ch)
+        i += 1
 
-    On Error GoTo FatalError
+    result.append("".join(buf).strip())
+    return result
 
-    selectedFile = Application.GetOpenFilename( _
-        "Excel Macro Files (*.xlsm),*.xlsm", _
-        , "Select XLSM File")
 
-    If VarType(selectedFile) = vbBoolean Then Exit Sub
+def extract_calls(formula, func_name):
+    pattern = re.compile(r"\b" + re.escape(func_name) + r"\s*\(", re.I)
+    result = []
 
-    oldCalculation = Application.Calculation
-    oldEvents = Application.EnableEvents
-    oldScreen = Application.ScreenUpdating
-    oldAlerts = Application.DisplayAlerts
+    for m in pattern.finditer(formula):
+        start = m.end()
+        depth = 1
+        quoted = False
+        i = start
 
-    Application.EnableEvents = False
-    Application.ScreenUpdating = False
-    Application.DisplayAlerts = False
-    Application.Calculation = xlCalculationManual
+        while i < len(formula):
+            ch = formula[i]
 
-    gStage = "Opening workbook"
+            if ch == '"':
+                if quoted and i + 1 < len(formula) and formula[i + 1] == '"':
+                    i += 2
+                    continue
+                quoted = not quoted
 
-    Set gWB = Workbooks.Open( _
-        Filename:=CStr(selectedFile), _
-        UpdateLinks:=0, _
-        ReadOnly:=True, _
-        IgnoreReadOnlyRecommended:=True)
+            elif not quoted:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        result.append(formula[start:i])
+                        break
 
-    InitializeAnalyzer
+            i += 1
 
-    gStage = "Loading sheets"
-    LoadSheets
+    return result
 
-    gStage = "Scanning formulas"
-    ScanFormulas
 
-    gStage = "Scanning hyperlinks"
-    ScanHyperlinks
+def remove_string_literals(formula):
+    return STRING_RE.sub('""', formula)
 
-    gStage = "Scanning VBA"
-    ScanVba
 
-    gStage = "Scanning shapes"
-    ScanShapes
+def extract_sheet_refs(formula, valid_names):
+    cleaned = remove_string_literals(formula)
+    found = set()
 
-    gStage = "Generating report"
-    GenerateReport
+    for m in SHEET_REF_RE.finditer(cleaned):
+        name = norm_name(m.group(1) or m.group(2))
+        actual = valid_names.get(name.casefold())
+        if actual:
+            found.add(actual)
 
-    outputFile = gWB.Path & Application.PathSeparator & _
-        GetBaseName(gWB.Name) & _
-        "_dependency_report_" & _
-        Format(Now, "yyyymmdd_hhnnss") & ".xlsx"
+    return found
 
-    gReport.SaveAs _
-        Filename:=outputFile, _
-        FileFormat:=xlOpenXMLWorkbook
 
-    gReport.Close SaveChanges:=False
-    Set gReport = Nothing
+def text_cell(cell, value):
+    cell.number_format = "@"
+    s = "" if value is None else str(value)
+    cell.value = s[:32767]
 
-    gWB.Close SaveChanges:=False
-    Set gWB = Nothing
 
-    RestoreApplication oldCalculation, oldEvents, _
-                       oldScreen, oldAlerts
+def normalize_macro_name(name):
+    s = str(name or "").strip().strip("'")
+    s = s.split("!")[-1]
+    s = s.split(".")[-1]
+    return s.strip().casefold()
 
-    MsgBox "Analysis completed." & vbCrLf & _
-           "Sheets: " & gSheets.Count & vbCrLf & _
-           "Formula cells: " & gFormulaCount & vbCrLf & _
-           "INDIRECT calls: " & gIndirectCount & vbCrLf & _
-           "Shapes: " & gShapeCount & vbCrLf & _
-           "Evidence: " & gEvidence.Count & vbCrLf & _
-           "Unresolved: " & gUnresolved.Count & vbCrLf & _
-           "Report: " & outputFile, vbInformation
 
-    Exit Sub
+# ============================================================
+# MAIN ANALYZER
+# ============================================================
 
-FatalError:
+class XLSMAnalyzer:
 
-    Dim errorMessage As String
+    def __init__(self, filename):
+        self.path = Path(filename).resolve()
 
-    errorMessage = _
-        "Analysis failed." & vbCrLf & _
-        "Error: " & Err.Number & vbCrLf & _
-        "Description: " & Err.Description & vbCrLf & _
-        "Stage: " & gStage & vbCrLf & _
-        "Sheet: " & gCurrentSheet & vbCrLf & _
-        "Cell: " & gCurrentCell
+        print("Loading workbook...")
 
-    On Error Resume Next
+        self.wb = load_workbook(
+            self.path,
+            data_only=False,
+            read_only=False,
+            keep_links=False
+        )
 
-    If Not gReport Is Nothing Then
-        gReport.Close SaveChanges:=False
-    End If
+        self.cached_wb = load_workbook(
+            self.path,
+            data_only=True,
+            read_only=True,
+            keep_links=False
+        )
 
-    If Not gWB Is Nothing Then
-        gWB.Close SaveChanges:=False
-    End If
+        self.sheets = list(self.wb.sheetnames)
 
-    RestoreApplication oldCalculation, oldEvents, _
-                       oldScreen, oldAlerts
+        self.sheet_lookup = {
+            s.casefold(): s for s in self.sheets
+        }
 
-    MsgBox errorMessage, vbCritical
+        self.data_links = set()
+        self.nav_links = set()
+        self.possible_links = set()
 
-End Sub
+        self.evidence = []
+        self.unresolved = []
+        self.indirect_details = []
 
-' ============================================================
-' INITIALIZATION
-' ============================================================
+        self.procedures = {}
+        self.macro_targets = defaultdict(set)
+        self.macro_calls = defaultdict(set)
 
-Private Sub InitializeAnalyzer()
+        self.shape_bindings = []
+        self.stats = Counter()
+        self.dedup = set()
 
-    Set gSheets = NewDict()
-    Set gData = NewDict()
-    Set gNav = NewDict()
+    # --------------------------------------------------------
+    # RELATION STORAGE
+    # --------------------------------------------------------
 
-    Set gEvidence = New Collection
-    Set gUnresolved = New Collection
+    def add_link(
+        self, source, target, category,
+        location, expression, method,
+        confidence="CONFIRMED"
+    ):
+        target = self.sheet_lookup.get(str(target).casefold())
 
-    Set gProcedures = NewDict()
-    Set gMacroTargets = NewDict()
+        if not target or source not in self.sheets:
+            return
 
-    gFormulaCount = 0
-    gIndirectCount = 0
-    gShapeCount = 0
+        if confidence == "POSSIBLE":
+            self.possible_links.add((source, target))
+        elif category == "DATA":
+            self.data_links.add((source, target))
+        else:
+            self.nav_links.add((source, target))
 
-    gCurrentSheet = ""
-    gCurrentCell = ""
+        key = (
+            source, target, category,
+            location, method, confidence
+        )
 
-End Sub
+        if key in self.dedup:
+            return
 
-Private Function NewDict() As Object
-
-    Dim d As Object
-
-    Set d = CreateObject("Scripting.Dictionary")
-    d.CompareMode = vbTextCompare
-
-    Set NewDict = d
-
-End Function
-
-Private Sub RestoreApplication( _
-    ByVal calculationMode As XlCalculation, _
-    ByVal eventsEnabled As Boolean, _
-    ByVal screenEnabled As Boolean, _
-    ByVal alertsEnabled As Boolean)
-
-    Application.Calculation = calculationMode
-    Application.EnableEvents = eventsEnabled
-    Application.ScreenUpdating = screenEnabled
-    Application.DisplayAlerts = alertsEnabled
-
-End Sub
-
-Private Function GetBaseName(ByVal fileName As String) As String
-
-    Dim p As Long
-
-    p = InStrRev(fileName, ".")
-
-    If p > 0 Then
-        GetBaseName = Left$(fileName, p - 1)
-    Else
-        GetBaseName = fileName
-    End If
-
-End Function
-
-' ============================================================
-' SHEETS
-' ============================================================
-
-Private Sub LoadSheets()
-
-    Dim ws As Worksheet
-
-    For Each ws In gWB.Worksheets
-        gSheets(ws.Name) = ws.Visible
-    Next ws
-
-End Sub
-
-Private Function SheetExists(ByVal name As String) As Boolean
-
-    SheetExists = gSheets.Exists(name)
-
-End Function
-
-Private Function NormalizeSheet(ByVal value As String) As String
-
-    Dim s As String
-
-    s = Trim$(value)
-
-    If Left$(s, 1) = "'" And Right$(s, 1) = "'" Then
-        If Len(s) >= 2 Then
-            s = Mid$(s, 2, Len(s) - 2)
-        End If
-    End If
-
-    s = Replace(s, "''", "'")
-
-    NormalizeSheet = s
-
-End Function
-
-' ============================================================
-' REGEX HELPERS
-' ============================================================
-
-Private Function RegexMatches( _
-    ByVal value As String, _
-    ByVal pattern As String) As Object
-
-    Dim re As Object
-
-    Set re = CreateObject("VBScript.RegExp")
-
-    re.Global = True
-    re.IgnoreCase = True
-    re.MultiLine = True
-    re.Pattern = pattern
-
-    Set RegexMatches = re.Execute(value)
-
-End Function
-
-Private Function RegexReplace( _
-    ByVal value As String, _
-    ByVal pattern As String, _
-    ByVal replacement As String) As String
-
-    Dim re As Object
-
-    Set re = CreateObject("VBScript.RegExp")
-
-    re.Global = True
-    re.IgnoreCase = True
-    re.Pattern = pattern
-
-    RegexReplace = re.Replace(value, replacement)
-
-End Function
-
-Private Function EscapeRegex(ByVal value As String) As String
-
-    Dim i As Long
-    Dim ch As String
-    Dim result As String
-
-    result = ""
-
-    For i = 1 To Len(value)
-
-        ch = Mid$(value, i, 1)
-
-        If InStr(1, "\.^$|?*+()[]{}", ch, _
-            vbBinaryCompare) > 0 Then
-            result = result & "\"
-        End If
-
-        result = result & ch
-
-    Next i
-
-    EscapeRegex = result
-
-End Function
-
-' ============================================================
-' RELATIONSHIP STORAGE
-' ============================================================
-
-Private Sub AddRelation( _
-    ByVal sourceSheet As String, _
-    ByVal targetSheet As String, _
-    ByVal relationType As String, _
-    ByVal location As String, _
-    ByVal expression As String, _
-    ByVal method As String)
-
-    Dim key As String
-
-    If Not SheetExists(sourceSheet) Then Exit Sub
-    If Not SheetExists(targetSheet) Then Exit Sub
-
-    key = sourceSheet & Chr$(30) & targetSheet
-
-    If relationType = "DATA" Then
-        gData(key) = True
-    Else
-        gNav(key) = True
-    End If
-
-    gEvidence.Add Array( _
-        sourceSheet, targetSheet, relationType, _
-        location, expression, method)
-
-End Sub
-
-Private Sub AddUnresolved( _
-    ByVal sourceSheet As String, _
-    ByVal location As String, _
-    ByVal category As String, _
-    ByVal expression As String, _
-    ByVal reason As String)
-
-    gUnresolved.Add Array( _
-        sourceSheet, location, category, _
-        expression, reason)
-
-End Sub
-
-' ============================================================
-' EXPLICIT SHEET REFERENCES
-' ============================================================
-
-Private Function ExtractSheetRefs( _
-    ByVal expression As String) As Object
-
-    Dim result As Object
-    Dim matches As Object
-    Dim m As Object
-    Dim target As String
-    Dim cleaned As String
-
-    Set result = NewDict()
-
-    ' Remove ordinary Excel string literals.
-    cleaned = RegexReplace( _
-        expression, _
-        """(?:[^""]|"""")*""", _
-        "")
-
-    ' Quoted sheet names.
-    Set matches = RegexMatches( _
-        cleaned, _
-        "'(([^']|'')+)'!")
-
-    For Each m In matches
-
-        target = NormalizeSheet(CStr(m.SubMatches(0)))
-
-        If SheetExists(target) Then
-            result(target) = True
-        End If
-
-    Next m
-
-    ' Unquoted names, including Japanese characters.
-    Set matches = RegexMatches( _
-        cleaned, _
-        "(^|[^A-Za-z0-9_.'\]])" & _
-        "([^ \t\r\n\+\-\*/\(\),=:!""']+)!")
-
-    For Each m In matches
-
-        target = NormalizeSheet(CStr(m.SubMatches(1)))
-
-        If SheetExists(target) Then
-            result(target) = True
-        End If
-
-    Next m
-
-    Set ExtractSheetRefs = result
-
-End Function
-
-' ============================================================
-' FORMULA SCANNING
-' ============================================================
-
-Private Sub ScanFormulas()
-
-    Dim ws As Worksheet
-    Dim formulaCells As Range
-    Dim cell As Range
-    Dim formula As String
-    Dim refs As Object
-    Dim target As Variant
-
-    For Each ws In gWB.Worksheets
-
-        gCurrentSheet = ws.Name
-        gStage = "Scanning formulas: " & ws.Name
-
-        Set formulaCells = Nothing
-
-        On Error Resume Next
-        Set formulaCells = ws.UsedRange.SpecialCells( _
-            xlCellTypeFormulas)
-        On Error GoTo 0
-
-        If Not formulaCells Is Nothing Then
-
-            For Each cell In formulaCells.Cells
-
-                gCurrentCell = cell.Address(False, False)
-                formula = CStr(cell.Formula)
-
-                gFormulaCount = gFormulaCount + 1
-
-                Set refs = ExtractSheetRefs(formula)
-
-                For Each target In refs.Keys
-
-                    AddRelation ws.Name, CStr(target), _
-                        "DATA", gCurrentCell, _
-                        formula, "Explicit formula"
-
-                Next target
-
-                If InStr(1, formula, "INDIRECT(", _
-                    vbTextCompare) > 0 Then
-
-                    gIndirectCount = gIndirectCount + 1
-
-                    AnalyzeIndirect ws, cell, formula
-
-                End If
-
-                If gFormulaCount Mod 10000 = 0 Then
-                    Application.StatusBar = _
-                        "Formula cells: " & gFormulaCount
-                End If
-
-            Next cell
-
-        End If
-
-    Next ws
-
-    Application.StatusBar = False
-
-End Sub
-
-' ============================================================
-' INDIRECT ANALYSIS
-' ============================================================
-
-Private Sub AnalyzeIndirect( _
-    ByVal ws As Worksheet, _
-    ByVal cell As Range, _
-    ByVal formula As String)
-
-    Dim refs As Object
-    Dim target As Variant
-    Dim matches As Object
-    Dim m As Object
-    Dim candidate As String
-    Dim found As Boolean
-
-    found = False
-
-    ' Find literal sheet names inside string expressions.
-    ' Example:
-    ' INDIRECT("サマリ!A1")
-    ' INDIRECT("サマリ!" & ADDRESS(...))
-
-    Set matches = RegexMatches( _
-        formula, _
-        """([^""]+)!")
-
-    For Each m In matches
-
-        candidate = NormalizeSheet( _
-            CStr(m.SubMatches(0)))
-
-        If SheetExists(candidate) Then
-
-            AddRelation ws.Name, candidate, _
-                "DATA", cell.Address(False, False), _
-                formula, "INDIRECT literal"
-
-            found = True
-
-        End If
-
-    Next m
-
-    ' Dynamic expressions may use a cell to hold
-    ' the destination sheet name.
-    '
-    ' Example:
-    ' INDIRECT("'" & $E36 & "'!$H$119:$W$123")
-    '
-    ' These are not automatically confirmed here.
-    ' They are reported for manual verification.
-
-    If Not found Then
-
-        AddUnresolved ws.Name, _
-            cell.Address(False, False), _
-            "INDIRECT", formula, _
-            "Dynamic target requires evaluation"
-
-    End If
-
-End Sub
-
-' ============================================================
-' HYPERLINKS
-' ============================================================
-
-Private Sub ScanHyperlinks()
-
-    Dim ws As Worksheet
-    Dim h As Hyperlink
-    Dim target As String
-    Dim subAddress As String
-    Dim p As Long
-
-    For Each ws In gWB.Worksheets
-
-        gCurrentSheet = ws.Name
-        gStage = "Scanning hyperlinks"
-
-        For Each h In ws.Hyperlinks
-
-            subAddress = h.SubAddress
-
-            If Len(subAddress) > 0 Then
-
-                p = InStr(1, subAddress, "!")
-
-                If p > 0 Then
-
-                    target = NormalizeSheet( _
-                        Left$(subAddress, p - 1))
-
-                    If SheetExists(target) Then
-
-                        AddRelation ws.Name, target, _
-                            "NAV", "Hyperlink", _
-                            subAddress, "Hyperlink"
-
-                    End If
-
-                End If
-
-            End If
-
-        Next h
-
-    Next ws
-
-End Sub
-
-' ============================================================
-' VBA PROCEDURE ANALYSIS
-' ============================================================
-
-Private Sub ScanVba()
-
-    Dim vbComponent As Object
-    Dim codeModule As Object
-
-    Dim i As Long
-    Dim lineText As String
-    Dim procName As String
-    Dim procBody As String
-
-    Dim matches As Object
-    Dim m As Object
-    Dim targets As Object
-    Dim target As Variant
-
-    gStage = "Scanning VBA modules"
-
-    On Error GoTo VbaAccessError
-
-    For Each vbComponent In gWB.VBProject.VBComponents
-
-        Set codeModule = vbComponent.CodeModule
-
-        procName = ""
-        procBody = ""
-
-        For i = 1 To codeModule.CountOfLines
-
-            lineText = codeModule.Lines(i, 1)
-
-            If IsProcedureStart(lineText) Then
-
-                If Len(procName) > 0 Then
-                    StoreProcedure procName, procBody
-                End If
-
-                procName = ExtractProcedureName(lineText)
-                procBody = lineText & vbCrLf
-
-            ElseIf Len(procName) > 0 Then
-
-                procBody = procBody & lineText & vbCrLf
-
-                If IsProcedureEnd(lineText) Then
-
-                    StoreProcedure procName, procBody
-
-                    procName = ""
-                    procBody = ""
-
-                End If
-
-            End If
-
-        Next i
-
-        If Len(procName) > 0 Then
-            StoreProcedure procName, procBody
-        End If
-
-    Next vbComponent
-
-    Exit Sub
-
-VbaAccessError:
-
-    AddUnresolved "", "", "VBA", "", _
-        "Cannot access VBA project: " & Err.Description
-
-    Err.Clear
-
-End Sub
-
-Private Function IsProcedureStart( _
-    ByVal lineText As String) As Boolean
-
-    IsProcedureStart = RegexMatches( _
-        Trim$(lineText), _
-        "^(Public |Private |Friend )?(Static )?" & _
-        "(Sub|Function) [A-Za-z_][A-Za-z0-9_]*").Count > 0
-
-End Function
-
-Private Function IsProcedureEnd( _
-    ByVal lineText As String) As Boolean
-
-    IsProcedureEnd = RegexMatches( _
-        Trim$(lineText), _
-        "^End (Sub|Function)").Count > 0
-
-End Function
-
-Private Function ExtractProcedureName( _
-    ByVal lineText As String) As String
-
-    Dim matches As Object
-
-    Set matches = RegexMatches( _
-        lineText, _
-        "(Sub|Function) +([A-Za-z_][A-Za-z0-9_]*)")
-
-    If matches.Count > 0 Then
-
-        ExtractProcedureName = _
-            CStr(matches(0).SubMatches(1))
-
-    Else
-
-        ExtractProcedureName = ""
-
-    End If
-
-End Function
-
-Private Sub StoreProcedure( _
-    ByVal procName As String, _
-    ByVal body As String)
-
-    Dim targets As Object
-    Dim matches As Object
-    Dim m As Object
-    Dim target As String
-
-    Set targets = NewDict()
-
-    ' Detect:
-    ' ThisWorkbook.Sheets("サマリ").Activate
-    ' Worksheets("マスタ").Select
-
-    Set matches = RegexMatches( _
-        body, _
-        "(Sheets|Worksheets)\s*\(\s*""([^""]+)""\s*\)" & _
-        "\s*\.\s*(Activate|Select)")
-
-    For Each m In matches
-
-        target = CStr(m.SubMatches(1))
-
-        If SheetExists(target) Then
-            targets(target) = True
-        End If
-
-    Next m
-
-    ' Also detect sheet-qualified Range access.
-    Set matches = RegexMatches( _
-        body, _
-        "(Sheets|Worksheets)\s*\(\s*""([^""]+)""\s*\)")
-
-    For Each m In matches
-
-        target = CStr(m.SubMatches(1))
-
-        If SheetExists(target) Then
-            targets(target) = True
-        End If
-
-    Next m
-
-    If gProcedures.Exists(procName) Then
-        gProcedures.Remove procName
-    End If
-
-    gProcedures.Add procName, body
-
-    If gMacroTargets.Exists(procName) Then
-        gMacroTargets.Remove procName
-    End If
-
-    ' Store object with Set.
-    gMacroTargets.Add procName, targets
-
-End Sub
-
-' ============================================================
-' SHAPES AND BUTTONS
-' ============================================================
-
-Private Sub ScanShapes()
-
-    Dim ws As Worksheet
-    Dim shp As Shape
-    Dim macroName As String
-    Dim procName As String
-    Dim targets As Object
-    Dim target As Variant
-
-    For Each ws In gWB.Worksheets
-
-        gCurrentSheet = ws.Name
-        gStage = "Scanning shapes"
-
-        For Each shp In ws.Shapes
-
-            gShapeCount = gShapeCount + 1
-
-            macroName = ""
-
-            On Error Resume Next
-            macroName = shp.OnAction
-            On Error GoTo 0
-
-            If Len(macroName) > 0 Then
-
-                procName = NormalizeMacroName(macroName)
-
-                If gMacroTargets.Exists(procName) Then
-
-                    Set targets = gMacroTargets(procName)
-
-                    For Each target In targets.Keys
-
-                        AddRelation ws.Name, CStr(target), _
-                            "NAV", shp.Name, _
-                            macroName, "Shape VBA macro"
-
-                    Next target
-
-                Else
-
-                    AddUnresolved ws.Name, _
-                        shp.Name, "Shape Macro", _
-                        macroName, _
-                        "Macro not resolved"
-
-                End If
-
-            End If
-
-        Next shp
-
-    Next ws
-
-End Sub
-
-Private Function NormalizeMacroName( _
-    ByVal macroName As String) As String
-
-    Dim p As Long
-    Dim s As String
-
-    s = Replace(macroName, "'", "")
-
-    p = InStrRev(s, "!")
-
-    If p > 0 Then
-        s = Mid$(s, p + 1)
-    End If
-
-    p = InStrRev(s, ".")
-
-    If p > 0 Then
-        s = Mid$(s, p + 1)
-    End If
-
-    NormalizeMacroName = Trim$(s)
-
-End Function
-
-' ============================================================
-' REPORT GENERATION
-' ============================================================
-
-Private Sub GenerateReport()
-
-    Set gReport = Workbooks.Add(xlWBATWorksheet)
-
-    WriteMatrix "Direct_Matrix", "ALL"
-    WriteMatrix "Data_Matrix", "DATA"
-    WriteMatrix "Navigation_Matrix", "NAV"
-
-    WriteEvidence
-    WriteUnresolved
-    WriteSheetInformation
-    WriteStatistics
-
-    Application.StatusBar = False
-
-End Sub
-
-Private Sub WriteMatrix( _
-    ByVal sheetName As String, _
-    ByVal matrixType As String)
-
-    Dim ws As Worksheet
-    Dim names As Variant
-    Dim i As Long
-    Dim j As Long
-    Dim key As String
-    Dim value As Long
-
-    Set ws = GetReportSheet(sheetName)
-
-    names = gSheets.Keys
-
-    ws.Cells(1, 1).Value = "Source / Target"
-
-    For i = 0 To UBound(names)
-
-        ws.Cells(i + 2, 1).Value = names(i)
-        ws.Cells(1, i + 2).Value = names(i)
-
-    Next i
-
-    For i = 0 To UBound(names)
-
-        For j = 0 To UBound(names)
-
-            key = CStr(names(i)) & Chr$(30) & _
-                  CStr(names(j))
-
-            value = 0
-
-            Select Case matrixType
-
-                Case "DATA"
-
-                    If gData.Exists(key) Then value = 1
-
-                Case "NAV"
-
-                    If gNav.Exists(key) Then value = 1
-
-                Case Else
-
-                    If gData.Exists(key) Or _
-                       gNav.Exists(key) Then
-                        value = 1
-                    End If
-
-            End Select
-
-            ws.Cells(i + 2, j + 2).Value = value
-
-        Next j
-
-    Next i
-
-    FormatReportSheet ws
-
-End Sub
-
-Private Sub WriteEvidence()
-
-    Dim ws As Worksheet
-    Dim headers As Variant
-    Dim item As Variant
-    Dim i As Long
-    Dim j As Long
-
-    Set ws = GetReportSheet("Dependency_Details")
-
-    headers = Array( _
-        "Source Sheet", "Target Sheet", _
-        "Type", "Location", _
-        "Expression", "Detection Method")
-
-    WriteHeaders ws, headers
-
-    For i = 1 To gEvidence.Count
-
-        item = gEvidence(i)
-
-        For j = 0 To UBound(item)
-
-            WriteTextCell ws.Cells(i + 1, j + 1), _
-                          CStr(item(j))
-
-        Next j
-
-    Next i
-
-    FormatReportSheet ws
-
-End Sub
-
-Private Sub WriteUnresolved()
-
-    Dim ws As Worksheet
-    Dim headers As Variant
-    Dim item As Variant
-    Dim i As Long
-    Dim j As Long
-
-    Set ws = GetReportSheet("Unresolved_References")
-
-    headers = Array( _
-        "Source Sheet", "Location", _
-        "Category", "Expression", "Reason")
-
-    WriteHeaders ws, headers
-
-    For i = 1 To gUnresolved.Count
-
-        item = gUnresolved(i)
-
-        For j = 0 To UBound(item)
-
-            WriteTextCell ws.Cells(i + 1, j + 1), _
-                          CStr(item(j))
-
-        Next j
-
-    Next i
-
-    FormatReportSheet ws
-
-End Sub
-
-Private Sub WriteSheetInformation()
-
-    Dim ws As Worksheet
-    Dim sourceWs As Worksheet
-    Dim i As Long
-    Dim visibility As String
-
-    Set ws = GetReportSheet("Sheet_Information")
-
-    WriteHeaders ws, Array( _
-        "Sheet Name", "Visibility", "Index")
-
-    i = 2
-
-    For Each sourceWs In gWB.Worksheets
-
-        Select Case sourceWs.Visible
-
-            Case xlSheetVisible
-                visibility = "Visible"
-
-            Case xlSheetHidden
-                visibility = "Hidden"
-
-            Case xlSheetVeryHidden
-                visibility = "VeryHidden"
-
-        End Select
-
-        ws.Cells(i, 1).Value = sourceWs.Name
-        ws.Cells(i, 2).Value = visibility
-        ws.Cells(i, 3).Value = sourceWs.Index
-
-        i = i + 1
-
-    Next sourceWs
-
-    FormatReportSheet ws
-
-End Sub
-
-Private Sub WriteStatistics()
-
-    Dim ws As Worksheet
-
-    Set ws = GetReportSheet("Statistics")
-
-    WriteHeaders ws, Array("Metric", "Value")
-
-    ws.Cells(2, 1).Value = "Sheets"
-    ws.Cells(2, 2).Value = gSheets.Count
-
-    ws.Cells(3, 1).Value = "Formula cells"
-    ws.Cells(3, 2).Value = gFormulaCount
-
-    ws.Cells(4, 1).Value = "INDIRECT calls detected"
-    ws.Cells(4, 2).Value = gIndirectCount
-
-    ws.Cells(5, 1).Value = "Shapes"
-    ws.Cells(5, 2).Value = gShapeCount
-
-    ws.Cells(6, 1).Value = "Data relationships"
-    ws.Cells(6, 2).Value = gData.Count
-
-    ws.Cells(7, 1).Value = "Navigation relationships"
-    ws.Cells(7, 2).Value = gNav.Count
-
-    ws.Cells(8, 1).Value = "Evidence rows"
-    ws.Cells(8, 2).Value = gEvidence.Count
-
-    ws.Cells(9, 1).Value = "Unresolved rows"
-    ws.Cells(9, 2).Value = gUnresolved.Count
-
-    FormatReportSheet ws
-
-End Sub
-
-' ============================================================
-' REPORT HELPERS
-' ============================================================
-
-Private Function GetReportSheet( _
-    ByVal sheetName As String) As Worksheet
-
-    Dim ws As Worksheet
-
-    On Error Resume Next
-
-    Set ws = gReport.Worksheets(sheetName)
-
-    On Error GoTo 0
-
-    If ws Is Nothing Then
-
-        Set ws = gReport.Worksheets.Add( _
-            After:=gReport.Worksheets( _
-                gReport.Worksheets.Count))
-
-        ws.Name = sheetName
-
-    End If
-
-    Set GetReportSheet = ws
-
-End Function
-
-Private Sub WriteHeaders( _
-    ByVal ws As Worksheet, _
-    ByVal headers As Variant)
-
-    Dim i As Long
-
-    For i = LBound(headers) To UBound(headers)
-
-        ws.Cells(1, i + 1).Value = headers(i)
-
-    Next i
-
-End Sub
-
-Private Sub WriteTextCell( _
-    ByVal target As Range, _
-    ByVal value As String)
-
-    ' Force text storage.
-    ' Prevent Excel from interpreting formula strings.
-
-    target.NumberFormat = "@"
-
-    ' Excel cell text limit is 32767 characters.
-    If Len(value) > 32767 Then
-        value = Left$(value, 32767)
-    End If
-
-    target.Value2 = value
-
-End Sub
-
-Private Sub FormatReportSheet(ByVal ws As Worksheet)
-
-    With ws.Rows(1)
-
-        .Font.Bold = True
-        .Interior.Color = RGB(35, 65, 100)
-        .Font.Color = RGB(255, 255, 255)
-
-    End With
-
-    ws.Rows(1).AutoFilter
-
-    ws.Cells.EntireColumn.AutoFit
-
-    If ws.Columns(1).ColumnWidth > 45 Then
-        ws.Columns(1).ColumnWidth = 45
-    End If
-
-End Sub
+        self.dedup.add(key)
+
+        if len(self.evidence) < MAX_EVIDENCE:
+            self.evidence.append((
+                source, target, category,
+                location, str(expression),
+                method, confidence
+            ))
+
+    def add_unresolved(
+        self, sheet, location,
+        category, expression, reason
+    ):
+        self.unresolved.append((
+            sheet, location, category,
+            str(expression), reason
+        ))
+
+    # --------------------------------------------------------
+    # VALUE ACCESS
+    # --------------------------------------------------------
+
+    def get_value(self, sheet, address):
+        try:
+            if sheet not in self.cached_wb.sheetnames:
+                return None
+
+            value = self.cached_wb[sheet][address].value
+
+            if value is not None:
+                return value
+
+            return self.wb[sheet][address].value
+
+        except Exception:
+            return None
+
+    def resolve_sheet(self, value):
+        name = norm_name(value)
+        return self.sheet_lookup.get(name.casefold())
+
+    # --------------------------------------------------------
+    # SIMPLE EXPRESSION EVALUATOR
+    # --------------------------------------------------------
+
+    def evaluate(
+        self, expression, source_sheet,
+        current_cell, depth=0, visited=None
+    ):
+        if depth > MAX_RECURSION:
+            return None
+
+        if visited is None:
+            visited = set()
+
+        expr = str(expression).strip()
+
+        if expr.startswith("="):
+            expr = expr[1:].strip()
+
+        if not expr:
+            return None
+
+        # Parenthesized expression
+        if expr.startswith("(") and expr.endswith(")"):
+            inner = expr[1:-1]
+            if len(split_top_level(inner, ",")) == 1:
+                result = self.evaluate(
+                    inner, source_sheet, current_cell,
+                    depth + 1, visited
+                )
+                if result is not None:
+                    return result
+
+        # String concatenation
+        parts = split_top_level(expr, "&")
+
+        if len(parts) > 1:
+            values = []
+
+            for part in parts:
+                v = self.evaluate(
+                    part, source_sheet, current_cell,
+                    depth + 1, visited
+                )
+                if v is None:
+                    return None
+                values.append(str(v))
+
+            return "".join(values)
+
+        # Literal string
+        if re.fullmatch(r'"(?:[^"]|"")*"', expr):
+            return expr[1:-1].replace('""', '"')
+
+        # Number
+        if re.fullmatch(r"-?\d+(?:\.\d+)?", expr):
+            try:
+                return int(expr)
+            except ValueError:
+                return float(expr)
+
+        # ROW()
+        if re.fullmatch(r"ROW\(\s*\)", expr, re.I):
+            return self.wb[source_sheet][current_cell].row
+
+        # COLUMN()
+        if re.fullmatch(r"COLUMN\(\s*\)", expr, re.I):
+            return self.wb[source_sheet][current_cell].column
+
+        # Simple arithmetic: ROW()-ROW($E$35)
+        m = re.fullmatch(
+            r"ROW\(\s*\)\s*-\s*ROW\(\s*\$?[A-Z]+\$?(\d+)\s*\)",
+            expr, re.I
+        )
+        if m:
+            return (
+                self.wb[source_sheet][current_cell].row
+                - int(m.group(1))
+            )
+
+        # SUBSTITUTE(text, old, new)
+        if re.match(r"^SUBSTITUTE\s*\(", expr, re.I):
+            calls = extract_calls(expr, "SUBSTITUTE")
+
+            if calls and expr.endswith(")"):
+                args = split_top_level(calls[0])
+
+                if len(args) >= 3:
+                    vals = [
+                        self.evaluate(
+                            a, source_sheet, current_cell,
+                            depth + 1, visited
+                        )
+                        for a in args[:3]
+                    ]
+
+                    if all(v is not None for v in vals):
+                        return str(vals[0]).replace(
+                            str(vals[1]), str(vals[2])
+                        )
+
+        # ADDRESS(row, column, [abs_num])
+        if re.match(r"^ADDRESS\s*\(", expr, re.I):
+            calls = extract_calls(expr, "ADDRESS")
+
+            if calls:
+                args = split_top_level(calls[0])
+
+                if len(args) >= 2:
+                    r = self.evaluate(
+                        args[0], source_sheet,
+                        current_cell, depth + 1, visited
+                    )
+                    c = self.evaluate(
+                        args[1], source_sheet,
+                        current_cell, depth + 1, visited
+                    )
+
+                    if isinstance(r, (int, float)) and \
+                       isinstance(c, (int, float)):
+                        if 1 <= int(c) <= 16384 and int(r) >= 1:
+                            return (
+                                "$" + get_column_letter(int(c))
+                                + "$" + str(int(r))
+                            )
+
+        # Local or qualified cell reference
+        m = re.fullmatch(
+            r"(?:(?:'((?:[^']|'')+)'|([^!]+))!)?"
+            r"(\$?[A-Z]{1,3}\$?\d+)",
+            expr, re.I
+        )
+
+        if m:
+            target_sheet = (
+                self.resolve_sheet(m.group(1) or m.group(2))
+                if (m.group(1) or m.group(2))
+                else source_sheet
+            )
+
+            address = m.group(3).replace("$", "")
+
+            if not target_sheet:
+                return None
+
+            visit_key = (target_sheet, address)
+
+            if visit_key in visited:
+                return None
+
+            new_visited = visited | {visit_key}
+
+            value = self.get_value(target_sheet, address)
+
+            if isinstance(value, str) and value.startswith("="):
+                return self.evaluate(
+                    value, target_sheet, address,
+                    depth + 1, new_visited
+                )
+
+            return value
+
+        # Cached result for unsupported functions is not
+        # evaluated here because there is no expression-cell
+        # mapping for arbitrary nested expressions.
+        return None
+
+    # --------------------------------------------------------
+    # INDIRECT
+    # --------------------------------------------------------
+
+    def analyze_indirect(self, sheet, cell, formula):
+        calls = extract_calls(formula, "INDIRECT")
+
+        for expression in calls:
+            self.stats["INDIRECT calls"] += 1
+
+            args = split_top_level(expression)
+
+            if not args:
+                continue
+
+            target_expr = args[0]
+
+            resolved = self.evaluate(
+                target_expr, sheet, cell
+            )
+
+            target = None
+            status = "UNRESOLVED"
+            reason = ""
+
+            if isinstance(resolved, str) and "!" in resolved:
+                sheet_part = resolved.rsplit("!", 1)[0]
+
+                # Remove external workbook prefix only when
+                # present; do not assume external references
+                # belong to this workbook.
+                if "[" in sheet_part or "]" in sheet_part:
+                    reason = "External workbook reference"
+                else:
+                    target = self.resolve_sheet(sheet_part)
+
+                    if target:
+                        self.add_link(
+                            sheet, target, "DATA",
+                            cell, formula,
+                            "INDIRECT evaluated"
+                        )
+                        status = "CONFIRMED"
+                    else:
+                        reason = "Target sheet not found"
+
+            elif isinstance(resolved, str):
+                # INDIRECT("A1") is a local reference.
+                if re.fullmatch(
+                    r"\$?[A-Z]{1,3}\$?\d+(?::\$?[A-Z]{1,3}\$?\d+)?",
+                    resolved, re.I
+                ):
+                    target = sheet
+                    status = "CONFIRMED"
+
+                    self.add_link(
+                        sheet, sheet, "DATA",
+                        cell, formula,
+                        "INDIRECT local range"
+                    )
+                else:
+                    reason = "No recognizable sheet target"
+
+            else:
+                reason = "Expression could not be evaluated"
+
+            # Explicit sheet names in string fragments can
+            # indicate possible targets, not confirmed targets.
+            if status == "UNRESOLVED":
+                for m in re.finditer(
+                    r'"([^"]+)!', target_expr
+                ):
+                    candidate = self.resolve_sheet(m.group(1))
+
+                    if candidate:
+                        self.add_link(
+                            sheet, candidate, "DATA",
+                            cell, formula,
+                            "INDIRECT literal candidate",
+                            "POSSIBLE"
+                        )
+
+                self.add_unresolved(
+                    sheet, cell, "INDIRECT",
+                    formula, reason
+                )
+
+            self.indirect_details.append((
+                sheet, cell, formula,
+                target_expr,
+                "" if resolved is None else str(resolved),
+                target or "",
+                status,
+                reason
+            ))
+
+    # --------------------------------------------------------
+    # FORMULAS
+    # --------------------------------------------------------
+
+    def scan_formulas(self):
+        print("Scanning formulas...")
+
+        for ws in self.wb.worksheets:
+            print("  Sheet:", ws.title)
+
+            for row in ws.iter_rows():
+                for cell in row:
+                    if cell.data_type != "f":
+                        continue
+
+                    self.stats["Formula cells"] += 1
+                    formula = str(cell.value or "")
+
+                    refs = extract_sheet_refs(
+                        formula, self.sheet_lookup
+                    )
+
+                    for target in refs:
+                        self.add_link(
+                            ws.title, target, "DATA",
+                            cell.coordinate, formula,
+                            "Explicit formula"
+                        )
+
+                    if re.search(
+                        r"\bINDIRECT\s*\(",
+                        formula, re.I
+                    ):
+                        self.analyze_indirect(
+                            ws.title, cell.coordinate,
+                            formula
+                        )
+
+                    # OFFSET/INDEX have a reference
+                    # argument. Explicit references are
+                    # already captured above.
+                    for fn in ("OFFSET", "INDEX"):
+                        for call in extract_calls(formula, fn):
+                            self.stats[fn + " calls"] += 1
+
+                            args = split_top_level(call)
+
+                            if args:
+                                for target in extract_sheet_refs(
+                                    args[0], self.sheet_lookup
+                                ):
+                                    self.add_link(
+                                        ws.title, target,
+                                        "DATA", cell.coordinate,
+                                        formula,
+                                        fn + " reference argument"
+                                    )
+
+                    if self.stats["Formula cells"] % 10000 == 0:
+                        print(
+                            "Processed:",
+                            self.stats["Formula cells"]
+                        )
+
+    # --------------------------------------------------------
+    # DEFINED NAMES
+    # --------------------------------------------------------
+
+    def scan_defined_names(self):
+        print("Scanning defined names...")
+
+        # Workbook-level defined names.
+        try:
+            definitions = list(
+                self.wb.defined_names.values()
+            )
+        except Exception:
+            definitions = []
+
+        for definition in definitions:
+            text = str(definition.attr_text or "")
+            refs = extract_sheet_refs(
+                text, self.sheet_lookup
+            )
+
+            # Workbook-level names do not have one
+            # source sheet. Record diagnostic evidence.
+            for target in refs:
+                self.add_unresolved(
+                    "", definition.name,
+                    "Defined Name",
+                    text,
+                    "Workbook-scoped name references "
+                    + target + "; usage requires tracing"
+                )
+
+    # --------------------------------------------------------
+    # HYPERLINKS
+    # --------------------------------------------------------
+
+    def scan_hyperlinks(self):
+        print("Scanning hyperlinks...")
+
+        for ws in self.wb.worksheets:
+            for row in ws.iter_rows():
+                for cell in row:
+                    link = cell.hyperlink
+
+                    if link is None:
+                        continue
+
+                    sub = str(link.location or "")
+
+                    if not sub and link.target:
+                        sub = str(link.target)
+
+                    if "!" not in sub:
+                        continue
+
+                    name = sub.rsplit("!", 1)[0]
+                    target = self.resolve_sheet(name)
+
+                    if target:
+                        self.add_link(
+                            ws.title, target, "NAV",
+                            cell.coordinate, sub,
+                            "Cell hyperlink"
+                        )
+
+    # --------------------------------------------------------
+    # VBA
+    # --------------------------------------------------------
+
+    def scan_vba(self):
+        print("Scanning VBA...")
+
+        if VBA_Parser is None:
+            self.add_unresolved(
+                "", "", "VBA", "",
+                "oletools not installed"
+            )
+            return
+
+        parser = None
+
+        try:
+            parser = VBA_Parser(str(self.path))
+
+            if not parser.detect_vba_macros():
+                return
+
+            for _, stream, module, code in parser.extract_macros():
+                self.stats["VBA modules"] += 1
+
+                if isinstance(code, bytes):
+                    code = code.decode(
+                        "utf-8", errors="replace"
+                    )
+
+                # Remove comment-only lines.
+                code = re.sub(
+                    r"(?m)^\s*'.*$", "", code
+                )
+
+                # Join VBA continuation lines.
+                code = re.sub(
+                    r"\s+_\s*\r?\n\s*",
+                    " ", code
+                )
+
+                starts = list(
+                    VBA_PROC_RE.finditer(code)
+                )
+
+                for idx, m in enumerate(starts):
+                    name = m.group(1).casefold()
+
+                    end = (
+                        starts[idx + 1].start()
+                        if idx + 1 < len(starts)
+                        else len(code)
+                    )
+
+                    body = code[m.start():end]
+
+                    # Prefer procedure bodies up to End Sub.
+                    end_match = re.search(
+                        r"(?im)^\s*End\s+(Sub|Function)\b",
+                        body
+                    )
+
+                    if end_match:
+                        body = body[:end_match.end()]
+
+                    self.procedures[name] = (
+                        self.procedures.get(name, "")
+                        + "\n" + body
+                    )
+
+            # Direct target sheets.
+            for proc, body in self.procedures.items():
+                for m in VBA_SHEET_RE.finditer(body):
+                    target = self.resolve_sheet(m.group(1))
+
+                    if target:
+                        self.macro_targets[proc].add(target)
+
+                # Discover simple procedure calls.
+                for m in VBA_CALL_RE.finditer(body):
+                    called = m.group(1).casefold()
+
+                    if called != proc:
+                        self.macro_calls[proc].add(called)
+
+            # Fixed-point propagation of macro calls.
+            for _ in range(20):
+                changed = False
+
+                for proc, calls in self.macro_calls.items():
+                    for called in calls:
+                        before = len(self.macro_targets[proc])
+
+                        self.macro_targets[proc].update(
+                            self.macro_targets.get(
+                                called, set()
+                            )
+                        )
+
+                        if len(self.macro_targets[proc]) > before:
+                            changed = True
+
+                if not changed:
+                    break
+
+            self.stats["VBA procedures"] = len(
+                self.procedures
+            )
+
+        except Exception as exc:
+            self.add_unresolved(
+                "", "", "VBA", "",
+                "VBA parsing failed: " + str(exc)
+            )
+
+        finally:
+            if parser is not None:
+                try:
+                    parser.close()
+                except Exception:
+                    pass
+
+    # --------------------------------------------------------
+    # SHAPE / VML METADATA
+    # --------------------------------------------------------
+
+    def scan_shapes(self):
+        print("Scanning drawing and VML metadata...")
+
+        with zipfile.ZipFile(self.path) as z:
+            names = set(z.namelist())
+
+            # Resolve worksheet XML to actual sheet names.
+            workbook_xml = ET.fromstring(
+                z.read("xl/workbook.xml")
+            )
+
+            rel_xml = ET.fromstring(
+                z.read("xl/_rels/workbook.xml.rels")
+            )
+
+            rel_map = {}
+
+            for rel in rel_xml:
+                rid = rel.attrib.get("Id")
+                target = rel.attrib.get("Target", "")
+
+                if target.startswith("/"):
+                    target = target.lstrip("/")
+                else:
+                    target = posixpath.normpath(
+                        posixpath.join("xl", target)
+                    )
+
+                rel_map[rid] = target
+
+            sheet_paths = {}
+
+            for item in workbook_xml.iter():
+                if item.tag.endswith("}sheet"):
+                    name = item.attrib.get("name")
+                    rid = item.attrib.get(
+                        "{" + NS_REL + "}id"
+                    )
+
+                    if rid in rel_map:
+                        sheet_paths[rel_map[rid]] = name
+
+            # Worksheet relationships connect each
+            # drawing or VML file to its source sheet.
+            drawing_sources = defaultdict(set)
+
+            for sheet_path, sheet_name in sheet_paths.items():
+                folder = posixpath.dirname(sheet_path)
+                base = posixpath.basename(sheet_path)
+
+                rel_path = (
+                    folder + "/_rels/" + base + ".rels"
+                )
+
+                if rel_path not in names:
+                    continue
+
+                root = ET.fromstring(z.read(rel_path))
+
+                for rel in root:
+                    target = rel.attrib.get("Target", "")
+                    kind = rel.attrib.get("Type", "")
+
+                    if "drawing" not in kind.lower():
+                        continue
+
+                    if target.startswith("/"):
+                        full = target.lstrip("/")
+                    else:
+                        full = posixpath.normpath(
+                            posixpath.join(folder, target)
+                        )
+
+                    drawing_sources[full].add(sheet_name)
+
+            for path, sources in drawing_sources.items():
+                if path not in names:
+                    continue
+
+                try:
+                    root = ET.fromstring(z.read(path))
+                except ET.ParseError:
+                    continue
+
+                for node in root.iter():
+                    tag = node.tag.split("}")[-1].lower()
+
+                    # VML FmlaMacro or Drawing macro attribute.
+                    macro = ""
+
+                    if tag == "fmlamacro":
+                        macro = node.text or ""
+
+                    if not macro:
+                        for k, v in node.attrib.items():
+                            if k.split("}")[-1].lower() == "macro":
+                                macro = v
+                                break
+
+                    if not macro:
+                        continue
+
+                    self.stats["Shape macro bindings"] += 1
+
+                    for source in sources:
+                        self.shape_bindings.append(
+                            (source, path, macro)
+                        )
+
+                        self.resolve_shape_macro(
+                            source, path, macro
+                        )
+
+    def resolve_shape_macro(
+        self, source, location, macro
+    ):
+        proc = normalize_macro_name(macro)
+
+        targets = self.macro_targets.get(proc, set())
+
+        if targets:
+            for target in targets:
+                self.add_link(
+                    source, target, "NAV",
+                    location, macro,
+                    "Shape macro binding"
+                )
+        else:
+            self.add_unresolved(
+                source, location,
+                "Shape Macro", macro,
+                "Macro target not statically resolved"
+            )
+
+    # --------------------------------------------------------
+    # REPORT
+    # --------------------------------------------------------
+
+    def create_matrix(self, wb, title, links):
+        ws = wb.create_sheet(title)
+
+        ws.cell(1, 1, "Source / Target")
+
+        for i, name in enumerate(self.sheets, 2):
+            ws.cell(1, i, name)
+            ws.cell(i, 1, name)
+
+        for i, source in enumerate(self.sheets, 2):
+            for j, target in enumerate(self.sheets, 2):
+                ws.cell(
+                    i, j,
+                    1 if (source, target) in links else 0
+                )
+
+        ws.freeze_panes = "B2"
+        return ws
+
+    def write_rows(self, wb, title, headers, rows):
+        ws = wb.create_sheet(title)
+        ws.append(headers)
+
+        for row in rows:
+            for col, value in enumerate(row, 1):
+                text_cell(
+                    ws.cell(ws.max_row + (1 if col == 1 else 0), col)
+                    if col == 1 else ws.cell(ws.max_row, col),
+                    value
+                )
+
+        ws.freeze_panes = "A2"
+        return ws
+
+    def report(self):
+        print("Generating report...")
+
+        out = Workbook()
+        out.remove(out.active)
+
+        all_links = self.data_links | self.nav_links
+
+        self.create_matrix(
+            out, "Direct_Matrix", all_links
+        )
+
+        self.create_matrix(
+            out, "Data_Matrix", self.data_links
+        )
+
+        self.create_matrix(
+            out, "Navigation_Matrix", self.nav_links
+        )
+
+        self.create_matrix(
+            out, "Possible_Matrix", self.possible_links
+        )
+
+        self.write_rows(
+            out, "Dependency_Details",
+            [
+                "Source Sheet", "Target Sheet",
+                "Category", "Location",
+                "Expression", "Method", "Confidence"
+            ],
+            self.evidence
+        )
+
+        self.write_rows(
+            out, "INDIRECT_Details",
+            [
+                "Sheet", "Cell", "Formula",
+                "INDIRECT Argument", "Resolved Value",
+                "Target Sheet", "Status", "Reason"
+            ],
+            self.indirect_details
+        )
+
+        self.write_rows(
+            out, "Unresolved_References",
+            [
+                "Sheet", "Location", "Category",
+                "Expression", "Reason"
+            ],
+            self.unresolved
+        )
+
+        self.write_rows(
+            out, "Shape_Bindings",
+            ["Source Sheet", "Drawing XML", "Macro"],
+            self.shape_bindings
+        )
+
+        self.write_rows(
+            out, "Sheet_Information",
+            ["Sheet", "Visibility", "Index"],
+            [
+                (ws.title, ws.sheet_state, i)
+                for i, ws in enumerate(
+                    self.wb.worksheets, 1
+                )
+            ]
+        )
+
+        statistics = [
+            ("Sheets", len(self.sheets)),
+            ("Confirmed data links", len(self.data_links)),
+            ("Confirmed navigation links", len(self.nav_links)),
+            ("Possible links", len(self.possible_links)),
+            ("Evidence rows", len(self.evidence)),
+            ("Unresolved rows", len(self.unresolved))
+        ]
+
+        statistics.extend(
+            sorted(self.stats.items())
+        )
+
+        self.write_rows(
+            out, "Statistics",
+            ["Metric", "Count"],
+            statistics
+        )
+
+        # Formatting
+        for ws in out.worksheets:
+            ws.sheet_view.showGridLines = False
+
+            for cell in ws[1]:
+                cell.fill = PatternFill(
+                    "solid", fgColor="17365D"
+                )
+                cell.font = Font(
+                    bold=True, color="FFFFFF"
+                )
+                cell.alignment = Alignment(
+                    vertical="center"
+                )
+
+            ws.row_dimensions[1].height = 28
+
+            if ws.title.endswith("_Matrix"):
+                ws.column_dimensions["A"].width = 38
+
+                for c in range(2, ws.max_column + 1):
+                    ws.column_dimensions[
+                        get_column_letter(c)
+                    ].width = 17
+
+            else:
+                for c in range(1, ws.max_column + 1):
+                    ws.column_dimensions[
+                        get_column_letter(c)
+                    ].width = 32
+
+            ws.auto_filter.ref = ws.dimensions
+
+        output_path = self.path.with_name(
+            self.path.stem
+            + "_dependency_report.xlsx"
+        )
+
+        out.save(output_path)
+
+        return output_path
+
+    # --------------------------------------------------------
+    # MAIN
+    # --------------------------------------------------------
+
+    def run(self):
+        self.scan_formulas()
+        self.scan_defined_names()
+        self.scan_hyperlinks()
+        self.scan_vba()
+        self.scan_shapes()
+
+        output = self.report()
+
+        print()
+        print("=" * 55)
+        print("ANALYSIS COMPLETED")
+        print("=" * 55)
+
+        print("Sheets:", len(self.sheets))
+        print(
+            "Formula cells:",
+            self.stats["Formula cells"]
+        )
+        print(
+            "INDIRECT calls:",
+            self.stats["INDIRECT calls"]
+        )
+        print(
+            "Confirmed data links:",
+            len(self.data_links)
+        )
+        print(
+            "Confirmed navigation links:",
+            len(self.nav_links)
+        )
+        print(
+            "Possible links:",
+            len(self.possible_links)
+        )
+        print(
+            "Unresolved rows:",
+            len(self.unresolved)
+        )
+        print("Report:", output)
+        print("=" * 55)
+
+        self.cached_wb.close()
+        self.wb.close()
+
+
+# ============================================================
+# CLI
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Analyze XLSM sheet dependencies"
+    )
+
+    parser.add_argument(
+        "file",
+        help="Path to source XLSM file"
+    )
+
+    args = parser.parse_args()
+
+    path = Path(args.file)
+
+    if not path.exists():
+        print("File not found:", path)
+        sys.exit(1)
+
+    if path.suffix.lower() != ".xlsm":
+        print("Only XLSM files are supported.")
+        sys.exit(1)
+
+    analyzer = XLSMAnalyzer(path)
+    analyzer.run()
+
+
+if __name__ == "__main__":
+    main()
