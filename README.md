@@ -1,4 +1,7 @@
 
+Get-ChildItem -Recurse -File | Select-String -Pattern "xxx" -SimpleMatch -List | Select-Object -ExpandProperty Path
+
+
 APEX開発環境のユーザー「userdev12」と、個人Work環境のユーザー「dev12」について、現在は利用者がいないと認識しています。
 
 今後、私がこの2つのアカウントを使用して作業を進める予定です。
