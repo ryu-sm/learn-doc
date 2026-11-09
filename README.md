@@ -3,26 +3,34 @@
 # -*- coding: utf-8 -*-
 
 """
-Excel XLSM Direct Sheet Dependency Analyzer
+XLSM Direct Sheet Dependency Analyzer
+=====================================
 
 Usage:
     python analyze_xlsm.py input.xlsm
 
-Optional:
     python analyze_xlsm.py input.xlsm -o report.xlsx
-    python analyze_xlsm.py input.xlsm --include-self
 
-Dependencies:
+    python analyze_xlsm.py input.xlsm --exclude-self
+
+Install:
     pip install openpyxl oletools
 
-Matrix:
-    Row    = Source Sheet
-    Column = Target Sheet
-    1      = Confirmed direct relationship
-    0      = No confirmed relationship
+Features:
+    - All sheets including hidden / veryHidden
+    - Explicit formula references
+    - INDIRECT static/dynamic references
+    - VBA navigation and simple data assignments
+    - VML / DrawingML button macros
+    - Cell and shape hyperlinks
+    - Direct dependency matrices
+    - Evidence and unresolved reports
 
-Note:
-    0 does NOT prove that no runtime dependency exists.
+Matrix direction:
+    Row    = Source sheet
+    Column = Referenced / destination sheet
+
+The script does not execute VBA or Excel formulas.
 """
 
 import argparse
@@ -37,12 +45,9 @@ from xml.etree import ElementTree as ET
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.formula import Tokenizer
-from openpyxl.styles import (
-    Font,
-    PatternFill,
-    Alignment
-)
+from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.cell import range_boundaries
 
 from oletools.olevba import VBA_Parser
 
@@ -138,15 +143,10 @@ def read_relationships(zf, part):
 
 def text_cell(cell, value):
     """
-    Force text storage.
-
-    Avoid interpreting formulas as Excel formulas
-    in the generated report.
+    Store all report expressions as literal text.
     """
     value = "" if value is None else str(value)
 
-    # Prefix formula-like values with a literal apostrophe
-    # so spreadsheet applications do not execute them.
     if value.startswith(("=", "+", "-", "@")):
         value = "'" + value
 
@@ -156,14 +156,6 @@ def text_cell(cell, value):
 
 
 def split_top_level(expression, separator=","):
-    """
-    Split an Excel expression at top-level separators.
-
-    Handles:
-      - Nested parentheses
-      - Quoted strings
-      - Doubled quotes
-    """
     result = []
     depth = 0
     quoted = False
@@ -202,11 +194,6 @@ def split_top_level(expression, separator=","):
 
 
 def extract_function_calls(formula, function):
-    """
-    Extract balanced function calls.
-
-    Returns a list of argument lists.
-    """
     pattern = re.compile(
         r"(?<![\w.])"
         + re.escape(function)
@@ -255,12 +242,6 @@ def extract_function_calls(formula, function):
 
 
 def excel_string_literals(expression):
-    """
-    Extract actual Excel string literals.
-
-    This avoids treating sheet names appearing
-    outside quoted strings as static literals.
-    """
     results = []
     i = 0
 
@@ -370,7 +351,7 @@ def logical_vba_lines(code):
 
 class XLSMAnalyzer:
 
-    def __init__(self, filename, include_self=False):
+    def __init__(self, filename, include_self=True):
         self.path = Path(filename)
         self.include_self = include_self
 
@@ -387,7 +368,6 @@ class XLSMAnalyzer:
             read_only=True
         )
 
-        # Include ALL sheets.
         self.sheet_names = list(self.wb.sheetnames)
 
         self.sheet_lookup = {
@@ -404,16 +384,6 @@ class XLSMAnalyzer:
             for ws in self.wb.worksheets
         }
 
-        self.code_names = {}
-
-        for ws in self.wb.worksheets:
-            code_name = ws.sheet_properties.codeName
-
-            if code_name:
-                self.code_names[
-                    code_name.casefold()
-                ] = ws.title
-
         self.data_links = {
             name: set()
             for name in self.sheet_names
@@ -426,12 +396,43 @@ class XLSMAnalyzer:
 
         self.evidence = set()
         self.unresolved = set()
-
         self.stats = Counter()
         self.procedures = defaultdict(list)
         self.procedure_navigation = defaultdict(set)
-
         self.link_counts = Counter()
+
+        # FIX:
+        # ReadOnlyWorksheet has no sheet_properties.
+        # Read CodeName from worksheet XML instead.
+        self.code_names = {}
+
+        with zipfile.ZipFile(self.path, "r") as zf:
+            sheet_mapping = self.sheet_xml_parts(zf)
+
+            for sheet_name, xml_path in sheet_mapping.items():
+                if xml_path not in zf.namelist():
+                    continue
+
+                try:
+                    with zf.open(xml_path) as stream:
+                        for _, element in ET.iterparse(
+                            stream, events=("start",)
+                        ):
+                            if local_name(element.tag) == "sheetPr":
+                                code_name = element.get("codeName")
+
+                                if code_name:
+                                    self.code_names[
+                                        code_name.casefold()
+                                    ] = sheet_name
+
+                                break
+
+                except Exception as exc:
+                    print(
+                        f"Warning: CodeName read failed "
+                        f"for {sheet_name}: {exc}"
+                    )
 
     # --------------------------------------------------------
     # Sheet Utilities
@@ -565,11 +566,6 @@ class XLSMAnalyzer:
         depth=0,
         visited=None
     ):
-        """
-        Evaluate only safe, supported expressions.
-
-        Does not execute Excel or VBA.
-        """
         if depth > MAX_RECURSION:
             return None
 
@@ -578,7 +574,6 @@ class XLSMAnalyzer:
         if expression.startswith("="):
             expression = expression[1:].strip()
 
-        # Excel concatenation
         parts = split_top_level(expression, "&")
 
         if len(parts) > 1:
@@ -599,7 +594,6 @@ class XLSMAnalyzer:
 
             return "".join(values)
 
-        # String literal
         if (
             expression.startswith('"')
             and expression.endswith('"')
@@ -608,17 +602,20 @@ class XLSMAnalyzer:
                 '""', '"'
             )
 
-        # Numeric literal
         if re.fullmatch(
             r"-?\d+(?:\.\d+)?",
             expression
         ):
             try:
-                return float(expression)
+                number = float(expression)
+                return (
+                    int(number)
+                    if number.is_integer()
+                    else number
+                )
             except ValueError:
                 return None
 
-        # Local cell
         if CELL_PATTERN.fullmatch(expression):
             return self.resolve_cell(
                 sheet,
@@ -627,7 +624,6 @@ class XLSMAnalyzer:
                 visited
             )
 
-        # Cross-sheet cell
         match = CROSS_CELL_PATTERN.fullmatch(
             expression
         )
@@ -645,7 +641,6 @@ class XLSMAnalyzer:
                 visited
             )
 
-        # Simple string functions
         match = re.fullmatch(
             r"(CONCATENATE|CONCAT|UPPER|LOWER|"
             r"TRIM|IFERROR)\s*\((.*)\)",
@@ -779,7 +774,6 @@ class XLSMAnalyzer:
             if "[" in sheet_part or "]" in sheet_part:
                 continue
 
-            # 3D references
             if ":" in sheet_part:
                 first, last = sheet_part.split(
                     ":", 1
@@ -812,16 +806,6 @@ class XLSMAnalyzer:
     # --------------------------------------------------------
 
     def static_indirect_targets(self, expression):
-        """
-        Detect literal sheet names inside INDIRECT.
-
-        Examples:
-            INDIRECT("サマリ!A1")
-            INDIRECT("'サマリ'!" & ADDRESS(...))
-            INDIRECT("サマリ!" & something)
-
-        This is a heuristic for embedded static names.
-        """
         targets = set()
 
         literals = excel_string_literals(expression)
@@ -861,11 +845,8 @@ class XLSMAnalyzer:
                 continue
 
             self.stats["indirect_calls"] += 1
-
             expression = args[0]
 
-            # Method 1:
-            # Fully resolve string expression
             resolved = self.evaluate_expression(
                 sheet,
                 expression
@@ -891,8 +872,6 @@ class XLSMAnalyzer:
 
                 continue
 
-            # Method 2:
-            # Find explicit sheet name in string literals
             static_targets = self.static_indirect_targets(
                 expression
             )
@@ -914,11 +893,6 @@ class XLSMAnalyzer:
 
                 continue
 
-            # Method 3:
-            # No sheet specified in ADDRESS:
-            # normally a current-sheet reference.
-            #
-            # Do not assume this for every expression.
             address_calls = extract_function_calls(
                 expression, "ADDRESS"
             )
@@ -930,14 +904,7 @@ class XLSMAnalyzer:
                     for call in address_calls
                 )
 
-                if all_local and not (
-                    "!" in expression
-                    or re.search(
-                        r"\bINDIRECT\s*\(",
-                        expression,
-                        re.I
-                    )
-                ):
+                if all_local and "!" not in expression:
                     self.stats[
                         "indirect_local_candidates"
                     ] += 1
@@ -978,10 +945,8 @@ class XLSMAnalyzer:
                         continue
 
                     self.stats["formula_cells"] += 1
-
                     formula = str(cell.value)
 
-                    # Explicit sheet references
                     targets = self.explicit_formula_targets(
                         formula
                     )
@@ -996,7 +961,6 @@ class XLSMAnalyzer:
                             formula
                         )
 
-                    # INDIRECT
                     if re.search(
                         r"\bINDIRECT\s*\(",
                         formula,
@@ -1008,14 +972,12 @@ class XLSMAnalyzer:
                             formula
                         )
 
-                    # OFFSET
                     self.stats["offset_calls"] += len(
                         extract_function_calls(
                             formula, "OFFSET"
                         )
                     )
 
-                    # HYPERLINK formula
                     for args in extract_function_calls(
                         formula, "HYPERLINK"
                     ):
@@ -1126,7 +1088,6 @@ class XLSMAnalyzer:
 
             for _, _, module, code in parser.extract_macros():
                 self.stats["vba_modules"] += 1
-
                 current_proc = None
 
                 for line_no, line in logical_vba_lines(
@@ -1175,7 +1136,6 @@ class XLSMAnalyzer:
 
             for module, line_no, line in lines:
 
-                # Set ws = Sheets("xxx")
                 match = re.match(
                     r"^Set\s+(\w+)\s*=\s*(.+)$",
                     line,
@@ -1197,7 +1157,6 @@ class XLSMAnalyzer:
 
                     continue
 
-                # Activate / Select
                 nav = re.search(
                     r"\.\s*(Activate|Select)\b",
                     line,
@@ -1212,7 +1171,6 @@ class XLSMAnalyzer:
 
                     direct_targets[proc].update(refs)
 
-                # Application.Goto
                 if re.search(
                     r"\b(?:Application\s*\.\s*)?"
                     r"Goto\b",
@@ -1225,7 +1183,6 @@ class XLSMAnalyzer:
                         )
                     )
 
-                # Explicit VBA assignments
                 if "=" in line and not re.match(
                     r"^(If|ElseIf|For|While|Do|"
                     r"Select|Case|Const|Dim)\b",
@@ -1253,7 +1210,6 @@ class XLSMAnalyzer:
                                 line
                             )
 
-                # Procedure calls
                 call = re.match(
                     r"^(?:Call\s+)?([^\s(]+)",
                     line,
@@ -1271,7 +1227,6 @@ class XLSMAnalyzer:
                     ):
                         calls[proc].add(called)
 
-        # Resolve procedure navigation targets
         resolved = {
             proc: set(direct_targets[proc])
             for proc in self.procedures
@@ -1294,7 +1249,6 @@ class XLSMAnalyzer:
                     changed = True
 
         self.procedure_navigation = resolved
-
         self.stats["vba_procedures"] = len(
             self.procedures
         )
@@ -1781,7 +1735,6 @@ class XLSMAnalyzer:
 
         self.create_count_matrix(wb)
 
-        # Sheet Information
         self.create_detail_sheet(
             wb,
             "Sheet_Information",
@@ -1798,7 +1751,6 @@ class XLSMAnalyzer:
             [45, 20]
         )
 
-        # Evidence
         self.create_detail_sheet(
             wb,
             "Dependency_Details",
@@ -1814,7 +1766,6 @@ class XLSMAnalyzer:
             [30, 30, 20, 30, 40, 110]
         )
 
-        # Unresolved
         self.create_detail_sheet(
             wb,
             "Unresolved_References",
@@ -1828,7 +1779,6 @@ class XLSMAnalyzer:
             [30, 35, 45, 110]
         )
 
-        # Statistics
         stats = [
             ("Total Sheets", len(self.sheet_names)),
             (
@@ -1922,7 +1872,6 @@ class XLSMAnalyzer:
         )
 
         wb.save(output)
-
         return stats
 
     # --------------------------------------------------------
@@ -1975,9 +1924,9 @@ def main():
     )
 
     parser.add_argument(
-        "--include-self",
+        "--exclude-self",
         action="store_true",
-        help="Include same-sheet references"
+        help="Exclude same-sheet references"
     )
 
     args = parser.parse_args()
@@ -2017,7 +1966,7 @@ def main():
 
     analyzer = XLSMAnalyzer(
         source,
-        include_self=args.include_self
+        include_self=not args.exclude_self
     )
 
     analyzer.run(output)
