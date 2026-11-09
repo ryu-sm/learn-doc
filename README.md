@@ -3,86 +3,113 @@ import argparse
 import re
 import sys
 import zipfile
-import posixpath
+from collections import defaultdict, Counter
 from pathlib import Path
-from collections import Counter, defaultdict
 from xml.etree import ElementTree as ET
 
 from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
-from openpyxl.utils.cell import range_boundaries, get_column_letter
-
-try:
-    from oletools.olevba import VBA_Parser
-except ImportError:
-    VBA_Parser = None
+from openpyxl.utils import get_column_letter
+from openpyxl.cell.cell import Cell
+from oletools.olevba import VBA_Parser
 
 
 # ============================================================
-# CONFIG
+# Configuration
 # ============================================================
 
-MAX_EXPRESSION_LENGTH = 32000
-MAX_RECURSION = 12
-MAX_EVIDENCE = 500000
+MAX_DETAILS = 200000
+MAX_UNRESOLVED = 50000
+MAX_EXPRESSION = 16000
+PROGRESS_INTERVAL = 10000
 
-SHEET_REF_RE = re.compile(
-    r"(?:'((?:[^']|'')+)'|"
-    r"([\w\u0080-\uffff.]+))!",
-    re.UNICODE
-)
+# True: include formulas referencing their own sheet
+INCLUDE_SELF_REFERENCE = False
 
-CELL_REF_RE = re.compile(
-    r"^\$?([A-Z]{1,3})\$?(\d+)$",
-    re.I
-)
-
-VBA_SHEET_RE = re.compile(
-    r'(?:Sheets|Worksheets)\s*\(\s*"([^"]+)"\s*\)',
-    re.I
-)
-
-VBA_PROC_RE = re.compile(
-    r'(?im)^\s*(?:(?:Public|Private|Friend|Static)\s+)*'
-    r'(?:Sub|Function)\s+([A-Za-z_]\w*)\s*\('
-)
-
-VBA_CALL_RE = re.compile(
-    r'(?im)^\s*(?:Call\s+)?([A-Za-z_]\w*)\b'
-)
-
-FUNC_RE = re.compile(r'\b(INDIRECT|OFFSET|INDEX)\s*\(', re.I)
-
-STRING_RE = re.compile(r'"(?:[^"]|"")*"')
-
-NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
-NS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-NS_PKG = "http://schemas.openxmlformats.org/package/2006/relationships"
+# True: add candidate references to matrix
+# Recommended False to avoid false positives
+INCLUDE_CANDIDATES_IN_MATRIX = False
 
 
 # ============================================================
-# BASIC UTILITIES
+# Utilities
 # ============================================================
 
-def norm_name(value):
+def log(message):
+    print(message, flush=True)
+
+
+def clean_text(value):
     if value is None:
         return ""
-    return str(value).strip().strip("'").replace("''", "'")
+    return str(value).replace("\x00", "")
 
 
-def split_top_level(expr, delimiter=","):
+def safe_text(value, limit=MAX_EXPRESSION):
+    text = clean_text(value)[:limit]
+
+    # Explicitly store as text, not an Excel formula.
+    # Prefixing with apostrophe prevents formula interpretation
+    # in spreadsheet applications.
+    if text.startswith(("=", "+", "-", "@")):
+        return "'" + text
+
+    return text
+
+
+def normalized_sheet_name(value):
+    value = clean_text(value).strip()
+    value = value.replace("''", "'")
+    return value
+
+
+def make_lookup(names):
+    return {name.casefold(): name for name in names}
+
+
+def find_sheet(name, lookup):
+    name = normalized_sheet_name(name)
+    return lookup.get(name.casefold())
+
+
+def strip_vba_comments(line):
+    """Remove VBA comments outside quoted strings."""
     result = []
-    buf = []
-    depth = 0
     quoted = False
     i = 0
 
-    while i < len(expr):
-        ch = expr[i]
+    while i < len(line):
+        ch = line[i]
 
         if ch == '"':
-            if quoted and i + 1 < len(expr) and expr[i + 1] == '"':
-                buf.append('""')
+            if quoted and i + 1 < len(line) and line[i + 1] == '"':
+                result.append('""')
+                i += 2
+                continue
+            quoted = not quoted
+
+        if not quoted and ch == "'":
+            break
+
+        result.append(ch)
+        i += 1
+
+    return "".join(result)
+
+
+def split_arguments(text):
+    """Split function arguments, respecting strings and parentheses."""
+    parts = []
+    depth = 0
+    quoted = False
+    start = 0
+    i = 0
+
+    while i < len(text):
+        ch = text[i]
+
+        if ch == '"':
+            if quoted and i + 1 < len(text) and text[i + 1] == '"':
                 i += 2
                 continue
             quoted = not quoted
@@ -92,25 +119,27 @@ def split_top_level(expr, delimiter=","):
                 depth += 1
             elif ch == ")":
                 depth -= 1
-            elif ch == delimiter and depth == 0:
-                result.append("".join(buf).strip())
-                buf = []
-                i += 1
-                continue
+            elif ch in ",;" and depth == 0:
+                parts.append(text[start:i].strip())
+                start = i + 1
 
-        buf.append(ch)
         i += 1
 
-    result.append("".join(buf).strip())
-    return result
+    parts.append(text[start:].strip())
+    return parts
 
 
-def extract_calls(formula, func_name):
-    pattern = re.compile(r"\b" + re.escape(func_name) + r"\s*\(", re.I)
-    result = []
+def function_calls(formula, function_name):
+    """Extract nested function argument strings."""
+    pattern = re.compile(
+        r"(?<![A-Za-z0-9_.])(?:_xlfn\.)?"
+        + re.escape(function_name)
+        + r"\s*\(",
+        re.I,
+    )
 
-    for m in pattern.finditer(formula):
-        start = m.end()
+    for match in pattern.finditer(formula):
+        start = match.end()
         depth = 1
         quoted = False
         i = start
@@ -130,528 +159,438 @@ def extract_calls(formula, func_name):
                 elif ch == ")":
                     depth -= 1
                     if depth == 0:
-                        result.append(formula[start:i])
+                        yield formula[start:i]
                         break
 
             i += 1
 
-    return result
-
-
-def remove_string_literals(formula):
-    return STRING_RE.sub('""', formula)
-
-
-def extract_sheet_refs(formula, valid_names):
-    cleaned = remove_string_literals(formula)
-    found = set()
-
-    for m in SHEET_REF_RE.finditer(cleaned):
-        name = norm_name(m.group(1) or m.group(2))
-        actual = valid_names.get(name.casefold())
-        if actual:
-            found.add(actual)
-
-    return found
-
-
-def text_cell(cell, value):
-    cell.number_format = "@"
-    s = "" if value is None else str(value)
-    cell.value = s[:32767]
-
-
-def normalize_macro_name(name):
-    s = str(name or "").strip().strip("'")
-    s = s.split("!")[-1]
-    s = s.split(".")[-1]
-    return s.strip().casefold()
-
 
 # ============================================================
-# MAIN ANALYZER
+# Dependency Analyzer
 # ============================================================
 
 class XLSMAnalyzer:
 
-    def __init__(self, filename):
-        self.path = Path(filename).resolve()
+    def __init__(self, source):
+        self.source = Path(source).resolve()
 
-        print("Loading workbook...")
+        if not self.source.is_file():
+            raise FileNotFoundError(self.source)
 
-        self.wb = load_workbook(
-            self.path,
-            data_only=False,
-            read_only=False,
-            keep_links=False
-        )
+        self.book = None
+        self.names = []
+        self.lookup = {}
+        self.code_to_sheet = {}
 
-        self.cached_wb = load_workbook(
-            self.path,
-            data_only=True,
-            read_only=True,
-            keep_links=False
-        )
-
-        self.sheets = list(self.wb.sheetnames)
-
-        self.sheet_lookup = {
-            s.casefold(): s for s in self.sheets
-        }
-
-        self.data_links = set()
-        self.nav_links = set()
-        self.possible_links = set()
-
-        self.evidence = []
+        self.edges = defaultdict(set)
+        self.details = []
         self.unresolved = []
-        self.indirect_details = []
+        self.counts = Counter()
 
-        self.procedures = {}
-        self.macro_targets = defaultdict(set)
-        self.macro_calls = defaultdict(set)
+        self.vba_procedures = {}
+        self.vba_modules = []
+        self.macro_bindings = []
+        self.cell_values = {}
+        self.defined_names = defaultdict(set)
 
-        self.shape_bindings = []
-        self.stats = Counter()
-        self.dedup = set()
+        self.truncated_details = 0
+        self.truncated_unresolved = 0
 
     # --------------------------------------------------------
-    # RELATION STORAGE
+    # Recording
     # --------------------------------------------------------
 
-    def add_link(
-        self, source, target, category,
-        location, expression, method,
-        confidence="CONFIRMED"
+    def add_edge(
+        self,
+        source,
+        target,
+        category,
+        location,
+        expression,
+        confidence="CONFIRMED",
     ):
-        target = self.sheet_lookup.get(str(target).casefold())
+        source = find_sheet(source, self.lookup)
+        target = find_sheet(target, self.lookup)
 
-        if not target or source not in self.sheets:
+        if not source or not target:
             return
 
-        if confidence == "POSSIBLE":
-            self.possible_links.add((source, target))
-        elif category == "DATA":
-            self.data_links.add((source, target))
-        else:
-            self.nav_links.add((source, target))
-
-        key = (
-            source, target, category,
-            location, method, confidence
-        )
-
-        if key in self.dedup:
+        if source == target and not INCLUDE_SELF_REFERENCE:
             return
 
-        self.dedup.add(key)
+        if (
+            confidence == "CONFIRMED"
+            or INCLUDE_CANDIDATES_IN_MATRIX
+        ):
+            self.edges[source].add(target)
 
-        if len(self.evidence) < MAX_EVIDENCE:
-            self.evidence.append((
-                source, target, category,
-                location, str(expression),
-                method, confidence
+        self.counts["evidence_" + category] += 1
+
+        if len(self.details) < MAX_DETAILS:
+            self.details.append((
+                source,
+                target,
+                category,
+                confidence,
+                location,
+                safe_text(expression),
             ))
+        else:
+            self.truncated_details += 1
 
     def add_unresolved(
-        self, sheet, location,
-        category, expression, reason
+        self,
+        source,
+        location,
+        category,
+        expression,
+        reason,
     ):
-        self.unresolved.append((
-            sheet, location, category,
-            str(expression), reason
-        ))
+        self.counts["unresolved_" + category] += 1
+
+        if len(self.unresolved) < MAX_UNRESOLVED:
+            self.unresolved.append((
+                source,
+                location,
+                category,
+                safe_text(expression),
+                reason,
+            ))
+        else:
+            self.truncated_unresolved += 1
 
     # --------------------------------------------------------
-    # VALUE ACCESS
+    # Load workbook
     # --------------------------------------------------------
 
-    def get_value(self, sheet, address):
-        try:
-            if sheet not in self.cached_wb.sheetnames:
-                return None
+    def load(self):
+        log("Loading workbook...")
 
-            value = self.cached_wb[sheet][address].value
+        # Normal mode is intentional:
+        # ReadOnlyWorksheet does not expose all sheet metadata.
+        self.book = load_workbook(
+            self.source,
+            read_only=False,
+            data_only=False,
+            keep_links=True,
+        )
 
-            if value is not None:
-                return value
+        self.names = list(self.book.sheetnames)
+        self.lookup = make_lookup(self.names)
 
-            return self.wb[sheet][address].value
+        for ws in self.book.worksheets:
+            self.code_to_sheet[ws.title.casefold()] = ws.title
 
-        except Exception:
-            return None
-
-    def resolve_sheet(self, value):
-        name = norm_name(value)
-        return self.sheet_lookup.get(name.casefold())
-
-    # --------------------------------------------------------
-    # SIMPLE EXPRESSION EVALUATOR
-    # --------------------------------------------------------
-
-    def evaluate(
-        self, expression, source_sheet,
-        current_cell, depth=0, visited=None
-    ):
-        if depth > MAX_RECURSION:
-            return None
-
-        if visited is None:
-            visited = set()
-
-        expr = str(expression).strip()
-
-        if expr.startswith("="):
-            expr = expr[1:].strip()
-
-        if not expr:
-            return None
-
-        # Parenthesized expression
-        if expr.startswith("(") and expr.endswith(")"):
-            inner = expr[1:-1]
-            if len(split_top_level(inner, ",")) == 1:
-                result = self.evaluate(
-                    inner, source_sheet, current_cell,
-                    depth + 1, visited
-                )
-                if result is not None:
-                    return result
-
-        # String concatenation
-        parts = split_top_level(expr, "&")
-
-        if len(parts) > 1:
-            values = []
-
-            for part in parts:
-                v = self.evaluate(
-                    part, source_sheet, current_cell,
-                    depth + 1, visited
-                )
-                if v is None:
-                    return None
-                values.append(str(v))
-
-            return "".join(values)
-
-        # Literal string
-        if re.fullmatch(r'"(?:[^"]|"")*"', expr):
-            return expr[1:-1].replace('""', '"')
-
-        # Number
-        if re.fullmatch(r"-?\d+(?:\.\d+)?", expr):
             try:
-                return int(expr)
-            except ValueError:
-                return float(expr)
+                self.code_to_sheet[
+                    ws.sheet_properties.codeName.casefold()
+                ] = ws.title
+            except (AttributeError, TypeError):
+                pass
 
-        # ROW()
-        if re.fullmatch(r"ROW\(\s*\)", expr, re.I):
-            return self.wb[source_sheet][current_cell].row
+        log(f"Sheets: {len(self.names)}")
 
-        # COLUMN()
-        if re.fullmatch(r"COLUMN\(\s*\)", expr, re.I):
-            return self.wb[source_sheet][current_cell].column
+        for ws in self.book.worksheets:
+            log(f"  {ws.title} [{ws.sheet_state}]")
 
-        # Simple arithmetic: ROW()-ROW($E$35)
-        m = re.fullmatch(
-            r"ROW\(\s*\)\s*-\s*ROW\(\s*\$?[A-Z]+\$?(\d+)\s*\)",
-            expr, re.I
-        )
-        if m:
-            return (
-                self.wb[source_sheet][current_cell].row
-                - int(m.group(1))
-            )
+    # --------------------------------------------------------
+    # Defined names
+    # --------------------------------------------------------
 
-        # SUBSTITUTE(text, old, new)
-        if re.match(r"^SUBSTITUTE\s*\(", expr, re.I):
-            calls = extract_calls(expr, "SUBSTITUTE")
+    def scan_defined_names(self):
+        log("Scanning defined names...")
 
-            if calls and expr.endswith(")"):
-                args = split_top_level(calls[0])
+        # Global names
+        for name, definition in self.book.defined_names.items():
+            self._process_defined_name(name, definition)
 
-                if len(args) >= 3:
-                    vals = [
-                        self.evaluate(
-                            a, source_sheet, current_cell,
-                            depth + 1, visited
-                        )
-                        for a in args[:3]
-                    ]
-
-                    if all(v is not None for v in vals):
-                        return str(vals[0]).replace(
-                            str(vals[1]), str(vals[2])
-                        )
-
-        # ADDRESS(row, column, [abs_num])
-        if re.match(r"^ADDRESS\s*\(", expr, re.I):
-            calls = extract_calls(expr, "ADDRESS")
-
-            if calls:
-                args = split_top_level(calls[0])
-
-                if len(args) >= 2:
-                    r = self.evaluate(
-                        args[0], source_sheet,
-                        current_cell, depth + 1, visited
-                    )
-                    c = self.evaluate(
-                        args[1], source_sheet,
-                        current_cell, depth + 1, visited
-                    )
-
-                    if isinstance(r, (int, float)) and \
-                       isinstance(c, (int, float)):
-                        if 1 <= int(c) <= 16384 and int(r) >= 1:
-                            return (
-                                "$" + get_column_letter(int(c))
-                                + "$" + str(int(r))
-                            )
-
-        # Local or qualified cell reference
-        m = re.fullmatch(
-            r"(?:(?:'((?:[^']|'')+)'|([^!]+))!)?"
-            r"(\$?[A-Z]{1,3}\$?\d+)",
-            expr, re.I
-        )
-
-        if m:
-            target_sheet = (
-                self.resolve_sheet(m.group(1) or m.group(2))
-                if (m.group(1) or m.group(2))
-                else source_sheet
-            )
-
-            address = m.group(3).replace("$", "")
-
-            if not target_sheet:
-                return None
-
-            visit_key = (target_sheet, address)
-
-            if visit_key in visited:
-                return None
-
-            new_visited = visited | {visit_key}
-
-            value = self.get_value(target_sheet, address)
-
-            if isinstance(value, str) and value.startswith("="):
-                return self.evaluate(
-                    value, target_sheet, address,
-                    depth + 1, new_visited
+        # Worksheet-local names
+        for ws in self.book.worksheets:
+            for name, definition in ws.defined_names.items():
+                self._process_defined_name(
+                    name, definition, ws.title
                 )
 
-            return value
+    def _process_defined_name(self, name, definition, owner=None):
+        value = clean_text(
+            getattr(definition, "attr_text", "")
+        )
 
-        # Cached result for unsupported functions is not
-        # evaluated here because there is no expression-cell
-        # mapping for arbitrary nested expressions.
-        return None
+        targets = self.explicit_targets(value)
+
+        for target in targets:
+            self.defined_names[name.casefold()].add(target)
+
+            if owner:
+                self.add_edge(
+                    owner, target,
+                    "DefinedName",
+                    name, value,
+                )
 
     # --------------------------------------------------------
-    # INDIRECT
+    # Explicit sheet references
     # --------------------------------------------------------
 
-    def analyze_indirect(self, sheet, cell, formula):
-        calls = extract_calls(formula, "INDIRECT")
+    def explicit_targets(self, expression):
+        """
+        Match:
+          Sheet1!A1
+          'Sheet A'!A1
+          '[Book.xlsm]Sheet A'!A1
+          Sheet1:Sheet3!A1
 
-        for expression in calls:
-            self.stats["INDIRECT calls"] += 1
+        Excludes sheet-name-looking text without !.
+        """
+        found = set()
 
-            args = split_top_level(expression)
+        pattern = re.compile(
+            r"(?:"
+            r"'((?:[^']|'')+)'"
+            r"|"
+            r"(?<![A-Za-z0-9_.])"
+            r"([^\s=+\-*/(),;:&\"'!]+)"
+            r")\s*!",
+            re.UNICODE,
+        )
+
+        for match in pattern.finditer(expression):
+            raw = match.group(1) or match.group(2)
+
+            if "]" in raw:
+                raw = raw.rsplit("]", 1)[-1]
+
+            target = find_sheet(raw, self.lookup)
+
+            if target:
+                found.add(target)
+                continue
+
+            # 3D references
+            if ":" in raw:
+                a, b = raw.split(":", 1)
+                a = find_sheet(a, self.lookup)
+                b = find_sheet(b, self.lookup)
+
+                if a and b:
+                    i = self.names.index(a)
+                    j = self.names.index(b)
+
+                    found.update(
+                        self.names[min(i, j):max(i, j) + 1]
+                    )
+
+        return found
+
+    # --------------------------------------------------------
+    # Static resolution of dynamic formulas
+    # --------------------------------------------------------
+
+    def string_literals(self, expression):
+        pattern = re.compile(r'"((?:[^"]|"")*)"')
+        return [
+            x.replace('""', '"')
+            for x in pattern.findall(expression)
+        ]
+
+    def resolve_indirect(self, formula, current_sheet):
+        """
+        Conservative resolver.
+
+        Handles literal sheet names and some cell-based
+        sheet selectors. Does not execute Excel formulas.
+        """
+        confirmed = set()
+        candidates = set()
+
+        for call in function_calls(formula, "INDIRECT"):
+            args = split_arguments(call)
 
             if not args:
                 continue
 
-            target_expr = args[0]
+            expr = args[0]
 
-            resolved = self.evaluate(
-                target_expr, sheet, cell
-            )
+            # Literal sheet references
+            confirmed.update(self.explicit_targets(expr))
 
-            target = None
-            status = "UNRESOLVED"
-            reason = ""
-
-            if isinstance(resolved, str) and "!" in resolved:
-                sheet_part = resolved.rsplit("!", 1)[0]
-
-                # Remove external workbook prefix only when
-                # present; do not assume external references
-                # belong to this workbook.
-                if "[" in sheet_part or "]" in sheet_part:
-                    reason = "External workbook reference"
-                else:
-                    target = self.resolve_sheet(sheet_part)
-
-                    if target:
-                        self.add_link(
-                            sheet, target, "DATA",
-                            cell, formula,
-                            "INDIRECT evaluated"
-                        )
-                        status = "CONFIRMED"
-                    else:
-                        reason = "Target sheet not found"
-
-            elif isinstance(resolved, str):
-                # INDIRECT("A1") is a local reference.
-                if re.fullmatch(
-                    r"\$?[A-Z]{1,3}\$?\d+(?::\$?[A-Z]{1,3}\$?\d+)?",
-                    resolved, re.I
-                ):
-                    target = sheet
-                    status = "CONFIRMED"
-
-                    self.add_link(
-                        sheet, sheet, "DATA",
-                        cell, formula,
-                        "INDIRECT local range"
-                    )
-                else:
-                    reason = "No recognizable sheet target"
-
-            else:
-                reason = "Expression could not be evaluated"
-
-            # Explicit sheet names in string fragments can
-            # indicate possible targets, not confirmed targets.
-            if status == "UNRESOLVED":
-                for m in re.finditer(
-                    r'"([^"]+)!', target_expr
-                ):
-                    candidate = self.resolve_sheet(m.group(1))
-
-                    if candidate:
-                        self.add_link(
-                            sheet, candidate, "DATA",
-                            cell, formula,
-                            "INDIRECT literal candidate",
-                            "POSSIBLE"
-                        )
-
-                self.add_unresolved(
-                    sheet, cell, "INDIRECT",
-                    formula, reason
+            # Examples:
+            # INDIRECT("'サマリ'!A1")
+            # INDIRECT("サマリ!$G" & ROW())
+            # INDIRECT("'サマリ'!$G" & ROW() & ...)
+            for literal in self.string_literals(expr):
+                confirmed.update(
+                    self.explicit_targets(literal)
                 )
 
-            self.indirect_details.append((
-                sheet, cell, formula,
-                target_expr,
-                "" if resolved is None else str(resolved),
-                target or "",
-                status,
-                reason
-            ))
+            # Case:
+            # INDIRECT("'" & $E36 & "'!$H$119:$W$123")
+            #
+            # Resolve selector from a literal cell value.
+            selector_pattern = re.compile(
+                r'(?:"[^"]*"\s*&\s*)?'
+                r'(\$?[A-Z]{1,3}\$?\d+)'
+                r'\s*&\s*"[^"]*!"',
+                re.I,
+            )
 
-    # --------------------------------------------------------
-    # FORMULAS
-    # --------------------------------------------------------
+            for match in selector_pattern.finditer(expr):
+                address = match.group(1).replace("$", "")
+                value = self.cell_values.get(
+                    (current_sheet, address)
+                )
+
+                if isinstance(value, str):
+                    target = find_sheet(value, self.lookup)
+
+                    if target:
+                        candidates.add(target)
+
+            # Also recognize literal text values that are
+            # exactly worksheet names.
+            for literal in self.string_literals(expr):
+                target = find_sheet(literal, self.lookup)
+
+                if target:
+                    candidates.add(target)
+
+        return confirmed, candidates
 
     def scan_formulas(self):
-        print("Scanning formulas...")
+        log("Scanning formulas...")
 
-        for ws in self.wb.worksheets:
-            print("  Sheet:", ws.title)
+        # Collect literal values used by selectors.
+        for ws in self.book.worksheets:
+            for row in ws.iter_rows():
+                for cell in row:
+                    if cell.value is None:
+                        continue
+
+                    if cell.data_type != "f":
+                        self.cell_values[
+                            (ws.title, cell.coordinate)
+                        ] = cell.value
+
+        processed = 0
+
+        for ws in self.book.worksheets:
+            log(f"Sheet: {ws.title}")
 
             for row in ws.iter_rows():
                 for cell in row:
                     if cell.data_type != "f":
                         continue
 
-                    self.stats["Formula cells"] += 1
-                    formula = str(cell.value or "")
+                    formula = clean_text(cell.value)
+                    location = cell.coordinate
 
-                    refs = extract_sheet_refs(
-                        formula, self.sheet_lookup
-                    )
+                    processed += 1
+                    self.counts["formula_cells"] += 1
 
-                    for target in refs:
-                        self.add_link(
-                            ws.title, target, "DATA",
-                            cell.coordinate, formula,
-                            "Explicit formula"
+                    if processed % PROGRESS_INTERVAL == 0:
+                        log(f"Processed formulas: {processed}")
+
+                    explicit = self.explicit_targets(formula)
+
+                    for target in explicit:
+                        self.add_edge(
+                            ws.title, target,
+                            "Formula",
+                            location, formula,
                         )
+
+                    # Defined-name references
+                    for name, targets in self.defined_names.items():
+                        if re.search(
+                            r"(?<![\w.])"
+                            + re.escape(name)
+                            + r"(?![\w.])",
+                            formula,
+                            re.I,
+                        ):
+                            for target in targets:
+                                self.add_edge(
+                                    ws.title, target,
+                                    "DefinedNameFormula",
+                                    location, formula,
+                                )
 
                     if re.search(
-                        r"\bINDIRECT\s*\(",
-                        formula, re.I
+                        r"(?:_xlfn\.)?INDIRECT\s*\(",
+                        formula,
+                        re.I,
                     ):
-                        self.analyze_indirect(
-                            ws.title, cell.coordinate,
-                            formula
+                        self.counts["indirect_calls"] += 1
+
+                        confirmed, candidates = (
+                            self.resolve_indirect(
+                                formula, ws.title
+                            )
                         )
 
-                    # OFFSET/INDEX have a reference
-                    # argument. Explicit references are
-                    # already captured above.
-                    for fn in ("OFFSET", "INDEX"):
-                        for call in extract_calls(formula, fn):
-                            self.stats[fn + " calls"] += 1
+                        for target in confirmed - explicit:
+                            self.add_edge(
+                                ws.title, target,
+                                "INDIRECT",
+                                location, formula,
+                            )
 
-                            args = split_top_level(call)
+                        for target in candidates - confirmed:
+                            self.add_edge(
+                                ws.title, target,
+                                "INDIRECT_SELECTOR",
+                                location, formula,
+                                "CANDIDATE",
+                            )
 
-                            if args:
-                                for target in extract_sheet_refs(
-                                    args[0], self.sheet_lookup
-                                ):
-                                    self.add_link(
-                                        ws.title, target,
-                                        "DATA", cell.coordinate,
-                                        formula,
-                                        fn + " reference argument"
-                                    )
+                        if not confirmed and not candidates:
+                            self.add_unresolved(
+                                ws.title,
+                                location,
+                                "INDIRECT",
+                                formula,
+                                "Runtime expression cannot be "
+                                "fully resolved statically",
+                            )
 
-                    if self.stats["Formula cells"] % 10000 == 0:
-                        print(
-                            "Processed:",
-                            self.stats["Formula cells"]
-                        )
+                    if re.search(
+                        r"(?:_xlfn\.)?OFFSET\s*\(",
+                        formula,
+                        re.I,
+                    ):
+                        self.counts["offset_calls"] += 1
 
-    # --------------------------------------------------------
-    # DEFINED NAMES
-    # --------------------------------------------------------
+                        # OFFSET normally uses its first
+                        # argument as the base reference.
+                        # If explicit_targets already finds
+                        # the sheet, it is recorded above.
+                        if not explicit:
+                            self.add_unresolved(
+                                ws.title,
+                                location,
+                                "OFFSET",
+                                formula,
+                                "No explicit cross-sheet "
+                                "base reference",
+                            )
 
-    def scan_defined_names(self):
-        print("Scanning defined names...")
+                    if (
+                        "INDIRECT(" not in formula.upper()
+                        and "OFFSET(" not in formula.upper()
+                        and not explicit
+                    ):
+                        self.counts["local_or_unknown"] += 1
 
-        # Workbook-level defined names.
-        try:
-            definitions = list(
-                self.wb.defined_names.values()
-            )
-        except Exception:
-            definitions = []
-
-        for definition in definitions:
-            text = str(definition.attr_text or "")
-            refs = extract_sheet_refs(
-                text, self.sheet_lookup
-            )
-
-            # Workbook-level names do not have one
-            # source sheet. Record diagnostic evidence.
-            for target in refs:
-                self.add_unresolved(
-                    "", definition.name,
-                    "Defined Name",
-                    text,
-                    "Workbook-scoped name references "
-                    + target + "; usage requires tracing"
-                )
+        log(f"Formula cells: {processed}")
 
     # --------------------------------------------------------
-    # HYPERLINKS
+    # Hyperlinks
     # --------------------------------------------------------
 
     def scan_hyperlinks(self):
-        print("Scanning hyperlinks...")
+        log("Scanning hyperlinks...")
 
-        for ws in self.wb.worksheets:
+        for ws in self.book.worksheets:
             for row in ws.iter_rows():
                 for cell in row:
                     link = cell.hyperlink
@@ -659,506 +598,657 @@ class XLSMAnalyzer:
                     if link is None:
                         continue
 
-                    sub = str(link.location or "")
+                    text = (
+                        clean_text(link.location)
+                        or clean_text(link.target)
+                    )
 
-                    if not sub and link.target:
-                        sub = str(link.target)
+                    targets = self.explicit_targets(text)
 
-                    if "!" not in sub:
-                        continue
-
-                    name = sub.rsplit("!", 1)[0]
-                    target = self.resolve_sheet(name)
-
-                    if target:
-                        self.add_link(
-                            ws.title, target, "NAV",
-                            cell.coordinate, sub,
-                            "Cell hyperlink"
+                    for target in targets:
+                        self.add_edge(
+                            ws.title, target,
+                            "Hyperlink",
+                            cell.coordinate,
+                            text,
                         )
 
+                    if not targets and "#" in text:
+                        fragment = text.split("#", 1)[-1]
+
+                        for target in self.explicit_targets(
+                            fragment
+                        ):
+                            self.add_edge(
+                                ws.title, target,
+                                "Hyperlink",
+                                cell.coordinate,
+                                text,
+                            )
+
     # --------------------------------------------------------
-    # VBA
+    # VBA extraction
     # --------------------------------------------------------
 
     def scan_vba(self):
-        print("Scanning VBA...")
+        log("Scanning VBA...")
 
-        if VBA_Parser is None:
-            self.add_unresolved(
-                "", "", "VBA", "",
-                "oletools not installed"
-            )
-            return
-
-        parser = None
+        parser = VBA_Parser(str(self.source))
 
         try:
-            parser = VBA_Parser(str(self.path))
-
             if not parser.detect_vba_macros():
+                log("No VBA macros found.")
                 return
 
-            for _, stream, module, code in parser.extract_macros():
-                self.stats["VBA modules"] += 1
-
-                if isinstance(code, bytes):
-                    code = code.decode(
-                        "utf-8", errors="replace"
-                    )
-
-                # Remove comment-only lines.
-                code = re.sub(
-                    r"(?m)^\s*'.*$", "", code
-                )
-
-                # Join VBA continuation lines.
-                code = re.sub(
-                    r"\s+_\s*\r?\n\s*",
-                    " ", code
-                )
-
-                starts = list(
-                    VBA_PROC_RE.finditer(code)
-                )
-
-                for idx, m in enumerate(starts):
-                    name = m.group(1).casefold()
-
-                    end = (
-                        starts[idx + 1].start()
-                        if idx + 1 < len(starts)
-                        else len(code)
-                    )
-
-                    body = code[m.start():end]
-
-                    # Prefer procedure bodies up to End Sub.
-                    end_match = re.search(
-                        r"(?im)^\s*End\s+(Sub|Function)\b",
-                        body
-                    )
-
-                    if end_match:
-                        body = body[:end_match.end()]
-
-                    self.procedures[name] = (
-                        self.procedures.get(name, "")
-                        + "\n" + body
-                    )
-
-            # Direct target sheets.
-            for proc, body in self.procedures.items():
-                for m in VBA_SHEET_RE.finditer(body):
-                    target = self.resolve_sheet(m.group(1))
-
-                    if target:
-                        self.macro_targets[proc].add(target)
-
-                # Discover simple procedure calls.
-                for m in VBA_CALL_RE.finditer(body):
-                    called = m.group(1).casefold()
-
-                    if called != proc:
-                        self.macro_calls[proc].add(called)
-
-            # Fixed-point propagation of macro calls.
-            for _ in range(20):
-                changed = False
-
-                for proc, calls in self.macro_calls.items():
-                    for called in calls:
-                        before = len(self.macro_targets[proc])
-
-                        self.macro_targets[proc].update(
-                            self.macro_targets.get(
-                                called, set()
-                            )
-                        )
-
-                        if len(self.macro_targets[proc]) > before:
-                            changed = True
-
-                if not changed:
-                    break
-
-            self.stats["VBA procedures"] = len(
-                self.procedures
-            )
-
-        except Exception as exc:
-            self.add_unresolved(
-                "", "", "VBA", "",
-                "VBA parsing failed: " + str(exc)
-            )
+            for _, stream, module_name, code in (
+                parser.extract_macros()
+            ):
+                self.vba_modules.append((
+                    clean_text(module_name),
+                    clean_text(code),
+                ))
 
         finally:
-            if parser is not None:
-                try:
-                    parser.close()
-                except Exception:
-                    pass
+            parser.close()
+
+        log(f"VBA modules: {len(self.vba_modules)}")
+
+        proc_pattern = re.compile(
+            r"^\s*(?:Public\s+|Private\s+|Friend\s+)?"
+            r"(?:Static\s+)?"
+            r"(Sub|Function)\s+"
+            r"([^\s(]+)",
+            re.I,
+        )
+
+        for module, code in self.vba_modules:
+            lines = code.splitlines()
+
+            current_name = None
+            current_lines = []
+            current_start = 0
+
+            def store():
+                if current_name:
+                    self.vba_procedures[
+                        current_name.casefold()
+                    ] = (
+                        module,
+                        current_start,
+                        "\n".join(current_lines),
+                    )
+
+            for line_no, line in enumerate(lines, 1):
+                match = proc_pattern.match(line)
+
+                if match:
+                    store()
+
+                    current_name = match.group(2)
+                    current_start = line_no
+                    current_lines = [line]
+                    continue
+
+                if current_name:
+                    current_lines.append(line)
+
+                    if re.match(
+                        r"^\s*End\s+(Sub|Function)\b",
+                        line,
+                        re.I,
+                    ):
+                        store()
+                        current_name = None
+                        current_lines = []
+
+            store()
+
+        log(f"VBA procedures: {len(self.vba_procedures)}")
 
     # --------------------------------------------------------
-    # SHAPE / VML METADATA
+    # VBA references and navigation
+    # --------------------------------------------------------
+
+    def vba_sheet_targets(self, code):
+        targets = set()
+
+        # Worksheets("サマリ")
+        # Sheets("集計表")
+        pattern = re.compile(
+            r"\b(?:Worksheets|Sheets)\s*\(\s*"
+            r'"((?:[^"]|"")*)"\s*\)',
+            re.I,
+        )
+
+        for match in pattern.finditer(code):
+            target = find_sheet(
+                match.group(1).replace('""', '"'),
+                self.lookup,
+            )
+
+            if target:
+                targets.add(target)
+
+        # Sheet CodeName references, e.g. Sheet3.Activate
+        for code_name, target in self.code_to_sheet.items():
+            if re.search(
+                r"(?<![\w])"
+                + re.escape(code_name)
+                + r"\s*\.",
+                code,
+                re.I,
+            ):
+                targets.add(target)
+
+        return targets
+
+    def scan_vba_references(self):
+        log("Analyzing VBA references...")
+
+        for module, code in self.vba_modules:
+            module_sheet = self.code_to_sheet.get(
+                module.casefold()
+            )
+
+            # Also recognize Sheet module names such as:
+            # Sheet1, Sheet2
+            if not module_sheet:
+                module_sheet = self.code_to_sheet.get(
+                    module.split(".")[0].casefold()
+                )
+
+            if not module_sheet:
+                continue
+
+            for target in self.vba_sheet_targets(code):
+                self.add_edge(
+                    module_sheet, target,
+                    "VBA_Module",
+                    module,
+                    code[:MAX_EXPRESSION],
+                )
+
+        # VBA routines assigned to shapes are processed
+        # separately to establish the source sheet.
+        for source, shape_name, macro in self.macro_bindings:
+            macro_name = macro.split("!")[-1]
+            macro_name = macro_name.strip("'\"")
+
+            key = macro_name.casefold()
+            visited = set()
+
+            targets = self.resolve_macro_calls(
+                key, visited, 0
+            )
+
+            if targets:
+                for target in targets:
+                    self.add_edge(
+                        source, target,
+                        "VBA_Button",
+                        shape_name,
+                        macro,
+                    )
+            else:
+                self.add_unresolved(
+                    source,
+                    shape_name,
+                    "VBA_Button",
+                    macro,
+                    "Macro not found or target unresolved",
+                )
+
+    def resolve_macro_calls(self, key, visited, depth):
+        if depth > 8 or key in visited:
+            return set()
+
+        visited.add(key)
+
+        procedure = self.vba_procedures.get(key)
+
+        if not procedure:
+            return set()
+
+        _, _, code = procedure
+
+        targets = self.vba_sheet_targets(code)
+
+        # Follow direct calls to other procedures.
+        # This is intentionally conservative.
+        for line in code.splitlines():
+            line = strip_vba_comments(line).strip()
+
+            if not line:
+                continue
+
+            for other in self.vba_procedures:
+                if other == key:
+                    continue
+
+                if re.match(
+                    r"^(?:Call\s+)?"
+                    + re.escape(other)
+                    + r"(?:\s*\(|\s*$)",
+                    line,
+                    re.I,
+                ):
+                    targets.update(
+                        self.resolve_macro_calls(
+                            other, visited, depth + 1
+                        )
+                    )
+
+        return targets
+
+    # --------------------------------------------------------
+    # Shape and VML metadata
     # --------------------------------------------------------
 
     def scan_shapes(self):
-        print("Scanning drawing and VML metadata...")
+        log("Scanning drawing and VML metadata...")
 
-        with zipfile.ZipFile(self.path) as z:
-            names = set(z.namelist())
+        # Resolve drawing/VML part -> owner sheet through
+        # workbook relationships and sheet relationships.
+        with zipfile.ZipFile(self.source) as archive:
+            names = set(archive.namelist())
 
-            # Resolve worksheet XML to actual sheet names.
-            workbook_xml = ET.fromstring(
-                z.read("xl/workbook.xml")
+            wb_xml = ET.fromstring(
+                archive.read("xl/workbook.xml")
             )
 
-            rel_xml = ET.fromstring(
-                z.read("xl/_rels/workbook.xml.rels")
+            ns_main = (
+                "http://schemas.openxmlformats.org/"
+                "spreadsheetml/2006/main"
+            )
+            ns_rel = (
+                "http://schemas.openxmlformats.org/"
+                "officeDocument/2006/relationships"
             )
 
+            rel_path = "xl/_rels/workbook.xml.rels"
             rel_map = {}
 
-            for rel in rel_xml:
-                rid = rel.attrib.get("Id")
-                target = rel.attrib.get("Target", "")
-
-                if target.startswith("/"):
-                    target = target.lstrip("/")
-                else:
-                    target = posixpath.normpath(
-                        posixpath.join("xl", target)
-                    )
-
-                rel_map[rid] = target
-
-            sheet_paths = {}
-
-            for item in workbook_xml.iter():
-                if item.tag.endswith("}sheet"):
-                    name = item.attrib.get("name")
-                    rid = item.attrib.get(
-                        "{" + NS_REL + "}id"
-                    )
-
-                    if rid in rel_map:
-                        sheet_paths[rel_map[rid]] = name
-
-            # Worksheet relationships connect each
-            # drawing or VML file to its source sheet.
-            drawing_sources = defaultdict(set)
-
-            for sheet_path, sheet_name in sheet_paths.items():
-                folder = posixpath.dirname(sheet_path)
-                base = posixpath.basename(sheet_path)
-
-                rel_path = (
-                    folder + "/_rels/" + base + ".rels"
+            if rel_path in names:
+                root = ET.fromstring(
+                    archive.read(rel_path)
                 )
 
-                if rel_path not in names:
+                for element in root:
+                    rid = element.attrib.get("Id")
+                    target = element.attrib.get("Target", "")
+
+                    if rid:
+                        rel_map[rid] = target
+
+            import posixpath
+
+            def resolve_path(base, target):
+                target = target.lstrip("/")
+
+                if target.startswith("xl/"):
+                    return posixpath.normpath(target)
+
+                return posixpath.normpath(
+                    posixpath.join(
+                        posixpath.dirname(base),
+                        target,
+                    )
+                )
+
+            for sheet_element in wb_xml.findall(
+                f".//{{{ns_main}}}sheet"
+            ):
+                source = sheet_element.attrib.get("name")
+                rid = sheet_element.attrib.get(
+                    f"{{{ns_rel}}}id"
+                )
+
+                if not source or not rid:
                     continue
 
-                root = ET.fromstring(z.read(rel_path))
+                sheet_path = resolve_path(
+                    "xl/workbook.xml",
+                    rel_map.get(rid, ""),
+                )
+
+                if sheet_path not in names:
+                    continue
+
+                sheet_rels_path = (
+                    posixpath.dirname(sheet_path)
+                    + "/_rels/"
+                    + posixpath.basename(sheet_path)
+                    + ".rels"
+                )
+
+                if sheet_rels_path not in names:
+                    continue
+
+                root = ET.fromstring(
+                    archive.read(sheet_rels_path)
+                )
 
                 for rel in root:
                     target = rel.attrib.get("Target", "")
-                    kind = rel.attrib.get("Type", "")
+                    part = resolve_path(
+                        sheet_path, target
+                    )
 
-                    if "drawing" not in kind.lower():
+                    if part not in names:
                         continue
 
-                    if target.startswith("/"):
-                        full = target.lstrip("/")
-                    else:
-                        full = posixpath.normpath(
-                            posixpath.join(folder, target)
-                        )
-
-                    drawing_sources[full].add(sheet_name)
-
-            for path, sources in drawing_sources.items():
-                if path not in names:
-                    continue
-
-                try:
-                    root = ET.fromstring(z.read(path))
-                except ET.ParseError:
-                    continue
-
-                for node in root.iter():
-                    tag = node.tag.split("}")[-1].lower()
-
-                    # VML FmlaMacro or Drawing macro attribute.
-                    macro = ""
-
-                    if tag == "fmlamacro":
-                        macro = node.text or ""
-
-                    if not macro:
-                        for k, v in node.attrib.items():
-                            if k.split("}")[-1].lower() == "macro":
-                                macro = v
-                                break
-
-                    if not macro:
+                    if not (
+                        "/drawings/" in part
+                        or "/vmlDrawings/" in part
+                    ):
                         continue
 
-                    self.stats["Shape macro bindings"] += 1
+                    raw = archive.read(part)
+                    content = raw.decode(
+                        "utf-8", errors="replace"
+                    )
 
-                    for source in sources:
-                        self.shape_bindings.append(
-                            (source, path, macro)
+                    # Drawing hyperlinks, macro attributes,
+                    # and VML FmlaMacro metadata.
+                    macro_values = set()
+
+                    try:
+                        tree = ET.fromstring(raw)
+
+                        for node in tree.iter():
+                            for attr, value in node.attrib.items():
+                                local = attr.split("}")[-1].lower()
+
+                                if local in (
+                                    "macro",
+                                    "fmlamacro",
+                                ):
+                                    macro_values.add(value)
+
+                            if node.tag.split("}")[-1].lower() == "fmlamacro":
+                                if node.text:
+                                    macro_values.add(node.text)
+
+                    except ET.ParseError:
+                        pass
+
+                    # Fallback for VML with unusual XML.
+                    for match in re.finditer(
+                        r"<[^>]*FmlaMacro[^>]*>"
+                        r"(.*?)"
+                        r"</[^>]*FmlaMacro>",
+                        content,
+                        re.I | re.S,
+                    ):
+                        macro_values.add(match.group(1))
+
+                    for macro in macro_values:
+                        macro = macro.strip()
+
+                        if macro.startswith("="):
+                            macro = macro[1:]
+
+                        macro = macro.strip('"')
+
+                        if macro:
+                            self.macro_bindings.append((
+                                source, part, macro
+                            ))
+
+                    # Static sheet references in shape XML
+                    for target in self.explicit_targets(content):
+                        self.add_edge(
+                            source, target,
+                            "ShapeReference",
+                            part,
+                            content[:MAX_EXPRESSION],
+                            "CANDIDATE",
                         )
 
-                        self.resolve_shape_macro(
-                            source, path, macro
-                        )
-
-    def resolve_shape_macro(
-        self, source, location, macro
-    ):
-        proc = normalize_macro_name(macro)
-
-        targets = self.macro_targets.get(proc, set())
-
-        if targets:
-            for target in targets:
-                self.add_link(
-                    source, target, "NAV",
-                    location, macro,
-                    "Shape macro binding"
-                )
-        else:
-            self.add_unresolved(
-                source, location,
-                "Shape Macro", macro,
-                "Macro target not statically resolved"
-            )
+        log(
+            "Shape macro bindings: "
+            f"{len(self.macro_bindings)}"
+        )
 
     # --------------------------------------------------------
-    # REPORT
+    # Report writing
     # --------------------------------------------------------
 
-    def create_matrix(self, wb, title, links):
-        ws = wb.create_sheet(title)
+    def write_sheet(self, wb, title, headers, rows):
+        log(f"Writing report sheet: {title}")
 
-        ws.cell(1, 1, "Source / Target")
-
-        for i, name in enumerate(self.sheets, 2):
-            ws.cell(1, i, name)
-            ws.cell(i, 1, name)
-
-        for i, source in enumerate(self.sheets, 2):
-            for j, target in enumerate(self.sheets, 2):
-                ws.cell(
-                    i, j,
-                    1 if (source, target) in links else 0
-                )
-
-        ws.freeze_panes = "B2"
-        return ws
-
-    def write_rows(self, wb, title, headers, rows):
         ws = wb.create_sheet(title)
         ws.append(headers)
 
-        for row in rows:
-            for col, value in enumerate(row, 1):
-                text_cell(
-                    ws.cell(ws.max_row + (1 if col == 1 else 0), col)
-                    if col == 1 else ws.cell(ws.max_row, col),
-                    value
-                )
+        count = 0
 
-        ws.freeze_panes = "A2"
+        for row in rows:
+            values = []
+
+            for value in row:
+                if value is None:
+                    value = ""
+
+                if isinstance(value, str):
+                    value = value[:32767]
+
+                values.append(value)
+
+            ws.append(values)
+            count += 1
+
+            if count % 10000 == 0:
+                log(f"  {title}: {count} rows")
+
+        log(f"Completed {title}: {count} rows")
+
         return ws
 
-    def report(self):
-        print("Generating report...")
+    def create_report(self):
+        log("Generating report...")
 
-        out = Workbook()
-        out.remove(out.active)
-
-        all_links = self.data_links | self.nav_links
-
-        self.create_matrix(
-            out, "Direct_Matrix", all_links
-        )
-
-        self.create_matrix(
-            out, "Data_Matrix", self.data_links
-        )
-
-        self.create_matrix(
-            out, "Navigation_Matrix", self.nav_links
-        )
-
-        self.create_matrix(
-            out, "Possible_Matrix", self.possible_links
-        )
-
-        self.write_rows(
-            out, "Dependency_Details",
-            [
-                "Source Sheet", "Target Sheet",
-                "Category", "Location",
-                "Expression", "Method", "Confidence"
-            ],
-            self.evidence
-        )
-
-        self.write_rows(
-            out, "INDIRECT_Details",
-            [
-                "Sheet", "Cell", "Formula",
-                "INDIRECT Argument", "Resolved Value",
-                "Target Sheet", "Status", "Reason"
-            ],
-            self.indirect_details
-        )
-
-        self.write_rows(
-            out, "Unresolved_References",
-            [
-                "Sheet", "Location", "Category",
-                "Expression", "Reason"
-            ],
-            self.unresolved
-        )
-
-        self.write_rows(
-            out, "Shape_Bindings",
-            ["Source Sheet", "Drawing XML", "Macro"],
-            self.shape_bindings
-        )
-
-        self.write_rows(
-            out, "Sheet_Information",
-            ["Sheet", "Visibility", "Index"],
-            [
-                (ws.title, ws.sheet_state, i)
-                for i, ws in enumerate(
-                    self.wb.worksheets, 1
-                )
-            ]
-        )
-
-        statistics = [
-            ("Sheets", len(self.sheets)),
-            ("Confirmed data links", len(self.data_links)),
-            ("Confirmed navigation links", len(self.nav_links)),
-            ("Possible links", len(self.possible_links)),
-            ("Evidence rows", len(self.evidence)),
-            ("Unresolved rows", len(self.unresolved))
-        ]
-
-        statistics.extend(
-            sorted(self.stats.items())
-        )
-
-        self.write_rows(
-            out, "Statistics",
-            ["Metric", "Count"],
-            statistics
-        )
-
-        # Formatting
-        for ws in out.worksheets:
-            ws.sheet_view.showGridLines = False
-
-            for cell in ws[1]:
-                cell.fill = PatternFill(
-                    "solid", fgColor="17365D"
-                )
-                cell.font = Font(
-                    bold=True, color="FFFFFF"
-                )
-                cell.alignment = Alignment(
-                    vertical="center"
-                )
-
-            ws.row_dimensions[1].height = 28
-
-            if ws.title.endswith("_Matrix"):
-                ws.column_dimensions["A"].width = 38
-
-                for c in range(2, ws.max_column + 1):
-                    ws.column_dimensions[
-                        get_column_letter(c)
-                    ].width = 17
-
-            else:
-                for c in range(1, ws.max_column + 1):
-                    ws.column_dimensions[
-                        get_column_letter(c)
-                    ].width = 32
-
-            ws.auto_filter.ref = ws.dimensions
-
-        output_path = self.path.with_name(
-            self.path.stem
+        output = self.source.with_name(
+            self.source.stem
             + "_dependency_report.xlsx"
         )
 
-        out.save(output_path)
+        # Stream output to reduce memory usage.
+        out = Workbook(write_only=True)
 
-        return output_path
+        matrix = []
+
+        for source in self.names:
+            matrix.append(
+                [source]
+                + [
+                    int(target in self.edges[source])
+                    for target in self.names
+                ]
+            )
+
+        self.write_sheet(
+            out,
+            "Direct_Matrix",
+            ["Source / Target"] + self.names,
+            matrix,
+        )
+
+        edge_rows = [
+            (source, target)
+            for source in self.names
+            for target in self.names
+            if target in self.edges[source]
+        ]
+
+        self.write_sheet(
+            out,
+            "Direct_Links",
+            ["Source Sheet", "Target Sheet"],
+            edge_rows,
+        )
+
+        self.write_sheet(
+            out,
+            "Evidence",
+            [
+                "Source Sheet",
+                "Target Sheet",
+                "Category",
+                "Confidence",
+                "Location",
+                "Expression",
+            ],
+            self.details,
+        )
+
+        self.write_sheet(
+            out,
+            "Unresolved",
+            [
+                "Source Sheet",
+                "Location",
+                "Category",
+                "Expression",
+                "Reason",
+            ],
+            self.unresolved,
+        )
+
+        self.write_sheet(
+            out,
+            "Sheet_List",
+            ["Sheet", "Visibility", "Outgoing Links"],
+            [
+                (
+                    ws.title,
+                    ws.sheet_state,
+                    len(self.edges[ws.title]),
+                )
+                for ws in self.book.worksheets
+            ],
+        )
+
+        self.write_sheet(
+            out,
+            "Macro_Bindings",
+            ["Source Sheet", "Shape / Part", "Macro"],
+            self.macro_bindings,
+        )
+
+        summary = [
+            ("Source File", self.source.name),
+            ("Total Sheets", len(self.names)),
+            (
+                "Confirmed Direct Links",
+                len(edge_rows),
+            ),
+            (
+                "Formula Cells",
+                self.counts["formula_cells"],
+            ),
+            (
+                "INDIRECT Calls",
+                self.counts["indirect_calls"],
+            ),
+            (
+                "OFFSET Calls",
+                self.counts["offset_calls"],
+            ),
+            (
+                "VBA Modules",
+                len(self.vba_modules),
+            ),
+            (
+                "VBA Procedures",
+                len(self.vba_procedures),
+            ),
+            (
+                "Macro Bindings",
+                len(self.macro_bindings),
+            ),
+            (
+                "Evidence Rows",
+                len(self.details),
+            ),
+            (
+                "Unresolved Rows",
+                len(self.unresolved),
+            ),
+            (
+                "Truncated Evidence",
+                self.truncated_details,
+            ),
+            (
+                "Truncated Unresolved",
+                self.truncated_unresolved,
+            ),
+        ]
+
+        summary.extend(
+            (key, value)
+            for key, value in sorted(self.counts.items())
+        )
+
+        self.write_sheet(
+            out,
+            "Summary",
+            ["Metric", "Value"],
+            summary,
+        )
+
+        log("Saving XLSX report...")
+
+        out.save(output)
+
+        log("XLSX report saved successfully.")
+        log(f"Report: {output}")
+
+        return output
 
     # --------------------------------------------------------
-    # MAIN
+    # Main
     # --------------------------------------------------------
 
     def run(self):
-        self.scan_formulas()
+        self.load()
         self.scan_defined_names()
+        self.scan_formulas()
         self.scan_hyperlinks()
         self.scan_vba()
         self.scan_shapes()
+        self.scan_vba_references()
 
-        output = self.report()
+        output = self.create_report()
 
-        print()
-        print("=" * 55)
-        print("ANALYSIS COMPLETED")
-        print("=" * 55)
+        log("")
+        log("========== ANALYSIS RESULT ==========")
+        log(f"Sheets: {len(self.names)}")
+        log(
+            "Formula cells: "
+            f"{self.counts['formula_cells']}"
+        )
+        log(
+            "INDIRECT calls: "
+            f"{self.counts['indirect_calls']}"
+        )
+        log(
+            "OFFSET calls: "
+            f"{self.counts['offset_calls']}"
+        )
+        log(f"VBA modules: {len(self.vba_modules)}")
+        log(
+            "Macro bindings: "
+            f"{len(self.macro_bindings)}"
+        )
+        log(
+            "Confirmed direct links: "
+            f"{sum(len(v) for v in self.edges.values())}"
+        )
+        log(f"Evidence rows: {len(self.details)}")
+        log(f"Unresolved rows: {len(self.unresolved)}")
+        log(f"Report: {output}")
+        log("=====================================")
 
-        print("Sheets:", len(self.sheets))
-        print(
-            "Formula cells:",
-            self.stats["Formula cells"]
-        )
-        print(
-            "INDIRECT calls:",
-            self.stats["INDIRECT calls"]
-        )
-        print(
-            "Confirmed data links:",
-            len(self.data_links)
-        )
-        print(
-            "Confirmed navigation links:",
-            len(self.nav_links)
-        )
-        print(
-            "Possible links:",
-            len(self.possible_links)
-        )
-        print(
-            "Unresolved rows:",
-            len(self.unresolved)
-        )
-        print("Report:", output)
-        print("=" * 55)
-
-        self.cached_wb.close()
-        self.wb.close()
-
-
-# ============================================================
-# CLI
-# ============================================================
 
 def main():
     parser = argparse.ArgumentParser(
@@ -1166,24 +1256,24 @@ def main():
     )
 
     parser.add_argument(
-        "file",
-        help="Path to source XLSM file"
+        "input",
+        help="Path to XLSM workbook",
     )
 
     args = parser.parse_args()
 
-    path = Path(args.file)
+    try:
+        analyzer = XLSMAnalyzer(args.input)
+        analyzer.run()
 
-    if not path.exists():
-        print("File not found:", path)
+    except KeyboardInterrupt:
+        log("Interrupted by user.")
+        sys.exit(130)
+
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
-
-    if path.suffix.lower() != ".xlsm":
-        print("Only XLSM files are supported.")
-        sys.exit(1)
-
-    analyzer = XLSMAnalyzer(path)
-    analyzer.run()
 
 
 if __name__ == "__main__":
