@@ -1,7 +1,7 @@
 APEXの知識が不足しているため、早急に習得する。
 また、ArgoCDの運用ルールを理解し、プロジェクト全体の構成を早めに完成させ、業務開発に着手する。
 
-
+python -c "from openpyxl import load_workbook; from collections import Counter; w=load_workbook('input_diagnostic.xlsx',read_only=True); s=w['Formula_Diagnostics']; c=Counter(str(r[4]) for r in list(s.values)[1:] if r[2]=='INDIRECT'); print(*c.most_common(),sep='\n')"
 import argparse
 import re
 import zipfile
