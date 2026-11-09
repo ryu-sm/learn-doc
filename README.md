@@ -1,3 +1,66 @@
+
+@'
+from openpyxl import load_workbook
+from collections import Counter
+
+w = load_workbook(
+    "input_diagnostic.xlsx",
+    read_only=True,
+    data_only=True
+)
+
+ws = w["Formula_Diagnostics"]
+
+rows = [
+    r for r in list(ws.values)[1:]
+    if r[2] == "INDIRECT"
+]
+
+print("INDIRECT total:", len(rows))
+
+patterns = Counter()
+
+for r in rows:
+    formula = str(r[5])
+
+    if "&" in formula:
+        patterns["String concatenation (&)"] += 1
+
+    if "INDEX(" in formula.upper():
+        patterns["INDEX + INDIRECT"] += 1
+
+    if "ADDRESS(" in formula.upper():
+        patterns["ADDRESS + INDIRECT"] += 1
+
+    if "MATCH(" in formula.upper():
+        patterns["MATCH + INDIRECT"] += 1
+
+    if "HLOOKUP(" in formula.upper():
+        patterns["HLOOKUP + INDIRECT"] += 1
+
+    if "VLOOKUP(" in formula.upper():
+        patterns["VLOOKUP + INDIRECT"] += 1
+
+    if "!" in formula:
+        patterns["Contains sheet separator"] += 1
+
+print("\nFormula patterns:")
+
+for name, count in patterns.most_common():
+    print(name, count)
+
+print("\nSample formula locations:")
+
+for r in rows[:10]:
+    print(r[0], r[1], r[4])
+'@ | python -
+
+
+
+
+
+
+
 APEXの知識が不足しているため、早急に習得する。
 また、ArgoCDの運用ルールを理解し、プロジェクト全体の構成を早めに完成させ、業務開発に着手する。
 
