@@ -3,26 +3,26 @@
 # -*- coding: utf-8 -*-
 
 """
-XLSM Dependency Analyzer V6
+XLSM Dependency Analyzer V6.3
 
 Install:
     pip install openpyxl oletools
 
 Run:
-    python -u analyze_xlsm_v6.py input.xlsm
+    python -u analyze_xlsm_v6_3.py input.xlsm
 
 Optional:
-    python -u analyze_xlsm_v6.py input.xlsm -o report.xlsx
+    python -u analyze_xlsm_v6_3.py input.xlsm -o report.xlsx
 
-The source XLSM is never modified.
-VBA macros are inspected, never executed.
+The original workbook is never modified.
+VBA macros are inspected but never executed.
 """
 
 import argparse
 import collections
 import posixpath
 import re
-import sys
+import tempfile
 import time
 import zipfile
 import xml.etree.ElementTree as ET
@@ -34,36 +34,31 @@ from openpyxl.cell import WriteOnlyCell
 from openpyxl.styles import Font, PatternFill
 
 
-REL_NS = (
+RNS = (
     "http://schemas.openxmlformats.org/"
     "officeDocument/2006/relationships"
 )
 
-SHEET_REF = re.compile(
-    r"(?<![\w.])"
-    r"(?:'((?:[^']|'')+)'|([\w.\u0080-\uffff]+))!"
-    r"\s*(?="
-    r"\$?[A-Z]{1,3}\$?\d"
-    r"|\$?[A-Z]{1,3}\s*:"
-    r"|\$?\d+\s*:)",
+SREF = re.compile(
+    r"(?:'((?:[^']|'')+)'|"
+    r"([\w.\u0080-\uffff]+))!",
     re.I
 )
 
-SIMPLE_CELL = re.compile(
+CELL = re.compile(
     r"(?:(?:'((?:[^']|'')+)'|"
     r"([\w.\u0080-\uffff]+))!)?"
-    r"(\$?[A-Z]{1,3}\$?\d+)",
+    r"(\$?[A-Z]{1,3}\$?\d+)$",
     re.I
 )
 
-VBA_SHEET = re.compile(
-    r'(?:ThisWorkbook\s*\.\s*)?'
+VREF = re.compile(
     r'(?:Worksheets|Sheets)'
     r'\s*\(\s*"([^"]+)"\s*\)',
     re.I
 )
 
-VBA_PROC = re.compile(
+PROC = re.compile(
     r"^\s*"
     r"(?:(?:Public|Private|Friend|Static)\s+)*"
     r"(?:Sub|Function)\s+"
@@ -71,49 +66,26 @@ VBA_PROC = re.compile(
     re.I | re.M
 )
 
-VBA_GOTO = re.compile(
-    r"(?i)"
-    r"\b(?:Application\s*\.\s*)?Goto\b"
-    r"|\.\s*(?:Activate|Select)\b"
+NAV = re.compile(
+    r"\.\s*(?:Activate|Select)\b"
+    r"|\b(?:Application\s*\.\s*)?Goto\b",
+    re.I
 )
 
 
 # ============================================================
-# Common utilities
+# Utilities
 # ============================================================
 
 def local(tag):
     return tag.rsplit("}", 1)[-1]
 
 
-def s(value):
+def text(value):
     return "" if value is None else str(value)
 
 
-def xmlrels(z, part):
-    rp = posixpath.join(
-        posixpath.dirname(part),
-        "_rels",
-        posixpath.basename(part) + ".rels"
-    )
-
-    if rp not in z.namelist():
-        return {}
-
-    root = ET.fromstring(z.read(rp))
-    result = {}
-
-    for r in root:
-        result[r.get("Id")] = (
-            r.get("Type", "").rsplit("/", 1)[-1],
-            r.get("Target", ""),
-            r.get("TargetMode", "")
-        )
-
-    return result
-
-
-def partpath(part, target):
+def joinpart(part, target):
     if target.startswith("/"):
         return target.lstrip("/")
 
@@ -125,76 +97,103 @@ def partpath(part, target):
     )
 
 
-def split(expr, separators=",;"):
-    result = []
+def relationships(z, part):
+    p = posixpath.join(
+        posixpath.dirname(part),
+        "_rels",
+        posixpath.basename(part) + ".rels"
+    )
+
+    if p not in z.namelist():
+        return {}
+
+    root = ET.fromstring(z.read(p))
+
+    return {
+        x.get("Id"): (
+            x.get("Type", "").rsplit("/", 1)[-1],
+            x.get("Target", ""),
+            x.get("TargetMode", "")
+        )
+        for x in root
+    }
+
+
+def split(expr, chars):
+    out = []
     buf = []
     depth = 0
     quote = False
     i = 0
 
     while i < len(expr):
-        c = expr[i]
+        ch = expr[i]
 
-        if c == '"':
+        if ch == '"':
             if (
                 quote
                 and i + 1 < len(expr)
                 and expr[i + 1] == '"'
             ):
-                buf.extend(('"', '"'))
+                buf.extend(['"', '"'])
                 i += 2
                 continue
 
             quote = not quote
 
         if not quote:
-            if c == "(":
+            if ch == "(":
                 depth += 1
 
-            elif c == ")":
+            elif ch == ")":
                 depth -= 1
 
-            elif c in separators and depth == 0:
-                result.append(
+            elif depth == 0 and ch in chars:
+                out.append(
                     "".join(buf).strip()
                 )
                 buf = []
                 i += 1
                 continue
 
-        buf.append(c)
+        buf.append(ch)
         i += 1
 
-    result.append("".join(buf).strip())
-    return result
+    out.append(
+        "".join(buf).strip()
+    )
+
+    return out
 
 
-def functions(expr, name):
-    pat = re.compile(
-        r"\b" + re.escape(name) + r"\s*\(",
+def calls(formula, name):
+    pattern = re.compile(
+        r"(?<![\w.])(?:_xlfn\.)?"
+        + re.escape(name)
+        + r"\s*\(",
         re.I
     )
 
     i = 0
-    quoted = False
+    quote = False
 
-    while i < len(expr):
-        if expr[i] == '"':
+    while i < len(formula):
+        if formula[i] == '"':
             if (
-                quoted
-                and i + 1 < len(expr)
-                and expr[i + 1] == '"'
+                quote
+                and i + 1 < len(formula)
+                and formula[i + 1] == '"'
             ):
                 i += 2
                 continue
 
-            quoted = not quoted
+            quote = not quote
             i += 1
             continue
 
         match = (
-            pat.match(expr, i)
-            if not quoted
+            pattern.match(formula, i)
+            if not quote
             else None
         )
 
@@ -207,14 +206,14 @@ def functions(expr, name):
         depth = 1
         inside = False
 
-        while j < len(expr):
-            c = expr[j]
+        while j < len(formula):
+            ch = formula[j]
 
-            if c == '"':
+            if ch == '"':
                 if (
                     inside
-                    and j + 1 < len(expr)
-                    and expr[j + 1] == '"'
+                    and j + 1 < len(formula)
+                    and formula[j + 1] == '"'
                 ):
                     j += 2
                     continue
@@ -222,14 +221,14 @@ def functions(expr, name):
                 inside = not inside
 
             elif not inside:
-                if c == "(":
+                if ch == "(":
                     depth += 1
 
-                elif c == ")":
+                elif ch == ")":
                     depth -= 1
 
                     if depth == 0:
-                        yield expr[start:j]
+                        yield formula[start:j]
                         break
 
             j += 1
@@ -237,7 +236,38 @@ def functions(expr, name):
         i = j + 1
 
 
-def unquote_formula(expr):
+def normalize_formula(value):
+    if value is None:
+        return ""
+
+    if not isinstance(value, str):
+        value = (
+            getattr(value, "text", None)
+            or getattr(value, "formula", None)
+            or text(value)
+        )
+
+    value = (
+        value.strip()
+        .replace("“", '"')
+        .replace("”", '"')
+        .replace("＂", '"')
+    )
+
+    if (
+        value.startswith("{=")
+        and value.endswith("}")
+    ):
+        value = value[1:-1]
+
+    return (
+        value[1:]
+        if value.startswith("=")
+        else value
+    )
+
+
+def unquoted(expr):
     return re.sub(
         r'"(?:[^"]|"")*"',
         lambda m: " " * len(m.group()),
@@ -245,72 +275,142 @@ def unquote_formula(expr):
     )
 
 
-def strip_outer(expr):
-    expr = expr.strip()
+def sanitized_copy_without_pivot_views(
+    source,
+    destination
+):
+    """
+    Create a temporary compatibility copy.
 
-    while (
-        expr.startswith("(")
-        and expr.endswith(")")
-    ):
-        depth = 0
-        quote = False
-        good = True
+    Removes PivotTable view references from the
+    temporary copy only. The original workbook
+    remains untouched and is used for pivot analysis.
+    """
 
-        for i, c in enumerate(expr):
-            if c == '"':
-                quote = not quote
+    with zipfile.ZipFile(source) as src:
+        with zipfile.ZipFile(
+            destination,
+            "w"
+        ) as dst:
 
-            if quote:
-                continue
+            for info in src.infolist():
+                payload = src.read(info.filename)
 
-            if c == "(":
-                depth += 1
-
-            elif c == ")":
-                depth -= 1
-
-                if (
-                    depth == 0
-                    and i != len(expr) - 1
+                if re.fullmatch(
+                    r"xl/worksheets/_rels/"
+                    r"sheet\d+\.xml\.rels",
+                    info.filename
                 ):
-                    good = False
-                    break
+                    root = ET.fromstring(payload)
 
-        if not good:
-            break
+                    for el in list(root):
+                        if el.get(
+                            "Type", ""
+                        ).endswith("/pivotTable"):
+                            root.remove(el)
 
-        expr = expr[1:-1].strip()
+                    payload = ET.tostring(
+                        root,
+                        encoding="utf-8",
+                        xml_declaration=True
+                    )
 
-    return expr
+                elif re.fullmatch(
+                    r"xl/worksheets/"
+                    r"sheet\d+\.xml",
+                    info.filename
+                ):
+                    root = ET.fromstring(payload)
+
+                    for el in list(root):
+                        if (
+                            local(el.tag)
+                            == "pivotTableParts"
+                        ):
+                            root.remove(el)
+
+                    payload = ET.tostring(
+                        root,
+                        encoding="utf-8",
+                        xml_declaration=True
+                    )
+
+                dst.writestr(
+                    info,
+                    payload
+                )
 
 
 # ============================================================
 # Analyzer
 # ============================================================
 
-class Analyzer:
+class Audit:
 
-    def __init__(self, source):
-        self.source = Path(source)
+    def __init__(self, path):
+        self.path = Path(path)
+        self._temp = None
 
-        # Normal mode enables fast random cell access.
-        self.wf = load_workbook(
-            source,
-            read_only=False,
-            data_only=False,
-            keep_links=False
-        )
+        try:
+            self.wf = load_workbook(
+                path,
+                data_only=False,
+                read_only=False,
+                keep_links=False
+            )
 
-        self.wv = load_workbook(
-            source,
-            read_only=False,
-            data_only=True,
-            keep_links=False
-        )
+            self.wv = load_workbook(
+                path,
+                data_only=True,
+                read_only=False,
+                keep_links=False
+            )
+
+        except (TypeError, ValueError, KeyError) as exc:
+            print(
+                "[COMPAT] Pivot metadata issue:",
+                str(exc)[:180],
+                flush=True
+            )
+
+            self._temp = tempfile.TemporaryDirectory(
+                prefix="xlsm_audit_"
+            )
+
+            clean = (
+                Path(self._temp.name)
+                / Path(path).name
+            )
+
+            sanitized_copy_without_pivot_views(
+                path,
+                clean
+            )
+
+            self.wf = load_workbook(
+                clean,
+                data_only=False,
+                read_only=False,
+                keep_links=False
+            )
+
+            self.wv = load_workbook(
+                clean,
+                data_only=True,
+                read_only=False,
+                keep_links=False
+            )
+
+            print(
+                "[COMPAT] Reading formulas from "
+                "temporary copy; pivot metadata "
+                "from original.",
+                flush=True
+            )
 
         self.names = list(self.wf.sheetnames)
 
-        self.names_map = {
+        self.lookup = {
             name.casefold(): name
             for name in self.names
         }
@@ -324,36 +424,36 @@ class Analyzer:
         self.evidence = []
         self.unresolved = []
         self.shapes = []
-        self.macro_routes = []
-        self.vba_refs = []
-        self.debug = []
-
-        self.seen = set()
-        self.stats = collections.Counter()
-
-        self.value_cache = {}
-        self.evaluating = set()
+        self.routes = []
+        self.indirect_debug = []
+        self.pivots = []
 
         self.procs = collections.defaultdict(list)
-        self.defined = {}
+        self.stats = collections.Counter()
 
-        for key, definition in (
+        self.cache = {}
+        self.active = set()
+        self.seen = set()
+
+        self.definitions = {}
+
+        for name, item in (
             self.wf.defined_names.items()
         ):
-            self.defined[key.casefold()] = s(
-                definition.attr_text
-            )
+            self.definitions[
+                name.casefold()
+            ] = text(item.attr_text)
 
     def canon(self, name):
-        return self.names_map.get(
-            s(name)
+        return self.lookup.get(
+            text(name)
             .strip()
             .replace("''", "'")
             .casefold()
         )
 
     # --------------------------------------------------------
-    # Record dependency
+    # Record relationships
     # --------------------------------------------------------
 
     def add(
@@ -361,8 +461,8 @@ class Analyzer:
         src,
         dst,
         kind,
-        category,
-        at,
+        reason,
+        where,
         detail,
         confirmed=True
     ):
@@ -390,8 +490,8 @@ class Analyzer:
             src,
             dst,
             kind,
-            category,
-            at,
+            reason,
+            where,
             confirmed
         )
 
@@ -407,16 +507,16 @@ class Analyzer:
                     if confirmed
                     else "Possible"
                 ),
-                category,
-                at,
-                s(detail)[:12000]
+                reason,
+                where,
+                text(detail)[:16000]
             ))
 
     # --------------------------------------------------------
-    # Resolve cell values
+    # Cell value resolution
     # --------------------------------------------------------
 
-    def getcell(
+    def cellvalue(
         self,
         sheet,
         coord,
@@ -424,41 +524,51 @@ class Analyzer:
     ):
         sheet = self.canon(sheet)
 
-        if not sheet or depth > 16:
+        if not sheet or depth > 18:
             return None
 
         key = (
             sheet,
-            coord.replace("$", "").upper()
+            coord.replace(
+                "$", ""
+            ).upper()
         )
 
-        if key in self.value_cache:
-            return self.value_cache[key]
+        if key in self.cache:
+            return self.cache[key]
 
-        if key in self.evaluating:
+        if key in self.active:
             return None
 
-        self.evaluating.add(key)
+        self.active.add(key)
 
         try:
-            value = self.wv[sheet][key[1]].value
+            value = (
+                self.wv[sheet][key[1]].value
+            )
 
             if value is None:
-                value = self.wf[sheet][key[1]].value
+                raw = (
+                    self.wf[sheet][key[1]].value
+                )
 
                 if (
-                    isinstance(value, str)
-                    and value.startswith("=")
+                    getattr(raw, "text", None)
+                    or (
+                        isinstance(raw, str)
+                        and raw.startswith("=")
+                    )
                 ):
-                    value = self.eval(
-                        value[1:],
+                    value = self.evaluate(
+                        normalize_formula(raw),
                         sheet,
                         key[1],
                         depth + 1
                     )
+                else:
+                    value = raw
 
-            if len(self.value_cache) < 100000:
-                self.value_cache[key] = value
+            self.cache[key] = value
 
             return value
 
@@ -466,42 +576,50 @@ class Analyzer:
             return None
 
         finally:
-            self.evaluating.discard(key)
+            self.active.discard(key)
 
     # --------------------------------------------------------
-    # Evaluate simple Excel expressions
+    # Excel expression evaluator
     # --------------------------------------------------------
 
-    def eval(
+    def evaluate(
         self,
         expr,
         sheet,
-        cell,
+        coord,
         depth=0
     ):
-        if depth > 16:
+        if depth > 18:
             return None
 
-        expr = strip_outer(
-            s(expr).strip()
-        )
+        expr = normalize_formula(expr).strip()
 
         if not expr:
             return None
 
-        # String concatenation:
-        # "'" & $E36 & "'!$H$119:$W$123"
-        parts = split(expr, "&")
+        while (
+            expr.startswith("(")
+            and expr.endswith(")")
+        ):
+            inside = expr[1:-1]
 
-        if len(parts) > 1:
+            if self._balanced(inside):
+                expr = inside.strip()
+            else:
+                break
+
+        # String concatenation
+        pieces = split(expr, "&")
+
+        if len(pieces) > 1:
             values = [
-                self.eval(
+                self.evaluate(
                     part,
                     sheet,
-                    cell,
+                    coord,
                     depth + 1
                 )
-                for part in parts
+                for part in pieces
             ]
 
             if any(
@@ -511,52 +629,51 @@ class Analyzer:
                 return None
 
             return "".join(
-                str(value)
-                for value in values
+                map(str, values)
             )
 
         # String literal
         if (
-            expr.startswith('"')
-            and expr.endswith('"')
+            len(expr) >= 2
+            and expr[0] == '"'
+            and expr[-1] == '"'
         ):
             return expr[1:-1].replace(
                 '""',
                 '"'
             )
 
-        # Numeric literal
+        # Number
         if re.fullmatch(
             r"[+-]?\d+(?:\.\d+)?",
             expr
         ):
-            if "." in expr:
-                return float(expr)
-
-            return int(expr)
-
-        # Cell reference
-        match = SIMPLE_CELL.fullmatch(expr)
-
-        if match:
-            target_sheet = (
-                match.group(1)
-                or match.group(2)
-                or sheet
+            return (
+                float(expr)
+                if "." in expr
+                else int(expr)
             )
 
-            return self.getcell(
-                target_sheet,
+        # Cell reference
+        match = CELL.fullmatch(expr)
+
+        if match:
+            return self.cellvalue(
+                match.group(1)
+                or match.group(2)
+                or sheet,
                 match.group(3),
                 depth + 1
             )
 
         # Defined names
-        if expr.casefold() in self.defined:
-            return self.eval(
-                self.defined[expr.casefold()],
+        if expr.casefold() in self.definitions:
+            return self.evaluate(
+                self.definitions[
+                    expr.casefold()
+                ],
                 sheet,
-                cell,
+                coord,
                 depth + 1
             )
 
@@ -569,39 +686,43 @@ class Analyzer:
             "LOWER",
             "CONCAT",
             "CONCATENATE",
-            "TEXT",
-            "ADDRESS"
+            "TEXT"
         )
 
-        for fname in supported:
+        for fn in supported:
             if not re.match(
-                r"^" + fname + r"\s*\(",
+                r"^(?:_xlfn\.)?"
+                + fn
+                + r"\s*\(",
                 expr,
                 re.I
             ):
                 continue
 
             found = list(
-                functions(expr, fname)
+                calls(expr, fn)
             )
 
             if not found:
                 continue
 
-            args = split(found[0])
+            args = split(
+                found[0],
+                ",;"
+            )
 
             values = [
-                self.eval(
+                self.evaluate(
                     arg,
                     sheet,
-                    cell,
+                    coord,
                     depth + 1
                 )
                 for arg in args
             ]
 
             if (
-                fname == "IFERROR"
+                fn == "IFERROR"
                 and len(values) >= 2
             ):
                 return (
@@ -611,7 +732,7 @@ class Analyzer:
                 )
 
             if (
-                fname == "IF"
+                fn == "IF"
                 and len(values) >= 3
                 and isinstance(
                     values[0],
@@ -625,7 +746,7 @@ class Analyzer:
                 )
 
             if (
-                fname == "SUBSTITUTE"
+                fn == "SUBSTITUTE"
                 and len(values) >= 3
                 and all(
                     v is not None
@@ -638,7 +759,7 @@ class Analyzer:
                 )
 
             if (
-                fname == "TRIM"
+                fn == "TRIM"
                 and values
                 and values[0] is not None
             ):
@@ -647,17 +768,25 @@ class Analyzer:
                 )
 
             if (
-                fname in ("UPPER", "LOWER")
+                fn == "UPPER"
                 and values
                 and values[0] is not None
             ):
-                if fname == "UPPER":
-                    return str(values[0]).upper()
-
-                return str(values[0]).lower()
+                return str(
+                    values[0]
+                ).upper()
 
             if (
-                fname in (
+                fn == "LOWER"
+                and values
+                and values[0] is not None
+            ):
+                return str(
+                    values[0]
+                ).lower()
+
+            if (
+                fn in (
                     "CONCAT",
                     "CONCATENATE"
                 )
@@ -671,32 +800,54 @@ class Analyzer:
                 )
 
             if (
-                fname == "TEXT"
+                fn == "TEXT"
                 and values
                 and values[0] is not None
             ):
                 return str(values[0])
 
-            return None
-
         return None
 
-    # --------------------------------------------------------
-    # Resolve target sheet from a link
-    # --------------------------------------------------------
+    @staticmethod
+    def _balanced(expr):
+        depth = 0
+        quote = False
+        i = 0
+
+        while i < len(expr):
+            if expr[i] == '"':
+                if (
+                    quote
+                    and i + 1 < len(expr)
+                    and expr[i + 1] == '"'
+                ):
+                    i += 2
+                    continue
+
+                quote = not quote
+
+            elif not quote:
+                if expr[i] == "(":
+                    depth += 1
+
+                elif expr[i] == ")":
+                    depth -= 1
+
+                    if depth < 0:
+                        return False
+
+            i += 1
+
+        return depth == 0 and not quote
 
     def target(self, value):
         value = (
-            s(value)
+            text(value)
             .strip()
             .lstrip("=#")
         )
 
-        match = re.search(
-            r"(?:'((?:[^']|'')+)'|"
-            r"([\w.\u0080-\uffff]+))!",
-            value
-        )
+        match = SREF.search(value)
 
         if match:
             return self.canon(
@@ -704,9 +855,9 @@ class Analyzer:
                 or match.group(2)
             )
 
-        if value.casefold() in self.defined:
+        if value.casefold() in self.definitions:
             return self.target(
-                self.defined[
+                self.definitions[
                     value.casefold()
                 ]
             )
@@ -719,43 +870,44 @@ class Analyzer:
 
     def scan_formulas(self):
         print(
-            "[1/5] Formula scan",
+            "[1/6] Scanning formulas",
             flush=True
         )
 
-        for ws in self.wf.worksheets:
+        for ws in self.wf:
             count = 0
 
             for row in ws:
                 for cell in row:
-                    formula = cell.value
+                    value = cell.value
 
                     if (
                         cell.data_type != "f"
                         and not (
-                            isinstance(formula, str)
-                            and formula.startswith("=")
+                            isinstance(value, str)
+                            and value.startswith("=")
                         )
                     ):
                         continue
 
-                    formula = s(formula)
+                    formula = normalize_formula(
+                        value
+                    )
+
+                    if not formula:
+                        continue
 
                     count += 1
                     self.stats["Formulas"] += 1
 
-                    # Direct cross-sheet references
-                    for match in SHEET_REF.finditer(
-                        unquote_formula(formula)
+                    # Direct references
+                    for match in SREF.finditer(
+                        unquoted(formula)
                     ):
-                        target_sheet = (
-                            match.group(1)
-                            or match.group(2)
-                        )
-
                         self.add(
                             ws.title,
-                            target_sheet,
+                            match.group(1)
+                            or match.group(2),
                             "DATA",
                             "DIRECT",
                             cell.coordinate,
@@ -763,16 +915,19 @@ class Analyzer:
                         )
 
                     # INDIRECT
-                    for expression in functions(
+                    for expr in calls(
                         formula,
                         "INDIRECT"
                     ):
                         self.stats["INDIRECT"] += 1
 
-                        args = split(expression)
+                        args = split(
+                            expr,
+                            ",;"
+                        )
 
-                        value = (
-                            self.eval(
+                        evaluated = (
+                            self.evaluate(
                                 args[0],
                                 ws.title,
                                 cell.coordinate
@@ -782,8 +937,51 @@ class Analyzer:
                         )
 
                         target_sheet = self.target(
-                            value
+                            evaluated
                         )
+
+                        status = (
+                            "RESOLVED"
+                            if target_sheet
+                            else "UNRESOLVED"
+                        )
+
+                        self.indirect_debug.append((
+                            ws.title,
+                            cell.coordinate,
+                            expr,
+                            text(evaluated),
+                            text(target_sheet),
+                            status,
+                            (
+                                text(
+                                    self.cellvalue(
+                                        ws.title,
+                                        "J6"
+                                    )
+                                )
+                                if re.search(
+                                    r"\$?J\$?6\b",
+                                    expr,
+                                    re.I
+                                )
+                                else ""
+                            ),
+                            (
+                                text(
+                                    self.cellvalue(
+                                        ws.title,
+                                        "K6"
+                                    )
+                                )
+                                if re.search(
+                                    r"\$?K\$?6\b",
+                                    expr,
+                                    re.I
+                                )
+                                else ""
+                            )
+                        ))
 
                         if target_sheet:
                             self.add(
@@ -794,18 +992,19 @@ class Analyzer:
                                 cell.coordinate,
                                 (
                                     formula
-                                    + " | resolved="
-                                    + s(value)
+                                    + " | "
+                                    + text(evaluated)
                                 )
                             )
 
                         elif (
-                            value is not None
+                            evaluated is not None
                             and re.fullmatch(
-                                r"\$?[A-Z]{1,3}\$?\d+"
+                                r"\$?[A-Z]{1,3}"
+                                r"\$?\d+"
                                 r"(?::\$?[A-Z]{1,3}"
                                 r"\$?\d+)?",
-                                s(value),
+                                text(evaluated),
                                 re.I
                             )
                         ):
@@ -824,59 +1023,29 @@ class Analyzer:
                                 cell.coordinate,
                                 "INDIRECT",
                                 formula,
-                                "Evaluated: " + repr(value)
+                                "Evaluated: "
+                                + repr(evaluated)
                             ))
 
-                            if ws.title == "サマリ":
-                                self.debug.append((
-                                    ws.title,
-                                    cell.coordinate,
-                                    "INDIRECT",
-                                    (
-                                        args[0]
-                                        if args
-                                        else ""
-                                    ),
-                                    repr(value),
-                                    repr(
-                                        self.getcell(
-                                            ws.title,
-                                            "E36"
-                                        )
-                                    )
-                                ))
-
                     # OFFSET
-                    for expression in functions(
+                    for expr in calls(
                         formula,
                         "OFFSET"
                     ):
                         self.stats["OFFSET"] += 1
 
-                        if not SHEET_REF.search(
-                            unquote_formula(expression)
-                        ):
-                            self.unresolved.append((
-                                ws.title,
-                                cell.coordinate,
-                                "OFFSET",
-                                formula,
-                                (
-                                    "Dynamic/local OFFSET; "
-                                    "no confirmed cross-sheet "
-                                    "target"
-                                )
-                            ))
-
-                    # HYPERLINK formula
-                    for expression in functions(
+                    # HYPERLINK
+                    for expr in calls(
                         formula,
                         "HYPERLINK"
                     ):
-                        args = split(expression)
+                        args = split(
+                            expr,
+                            ",;"
+                        )
 
-                        value = (
-                            self.eval(
+                        evaluated = (
+                            self.evaluate(
                                 args[0],
                                 ws.title,
                                 cell.coordinate
@@ -886,7 +1055,7 @@ class Analyzer:
                         )
 
                         target_sheet = self.target(
-                            value
+                            evaluated
                         )
 
                         if target_sheet:
@@ -905,27 +1074,8 @@ class Analyzer:
                 flush=True
             )
 
-        # Special regression diagnostics
-        if self.canon("サマリ"):
-            e36 = self.getcell(
-                "サマリ",
-                "E36"
-            )
-
-            self.debug.insert(0, (
-                "サマリ",
-                "E36",
-                "ACTUAL_VALUE",
-                "",
-                repr(e36),
-                (
-                    "Expected sheet: "
-                    + s(self.canon(e36))
-                )
-            ))
-
     # --------------------------------------------------------
-    # Shape recording
+    # Shape and hyperlink analysis
     # --------------------------------------------------------
 
     def shape(
@@ -936,78 +1086,65 @@ class Analyzer:
         name,
         link,
         macro,
-        part,
-        note=""
+        part
     ):
         self.shapes.append((
             sheet,
             kind,
-            s(ident),
-            s(name),
-            s(link),
-            s(macro),
-            part,
-            s(note)
+            text(ident),
+            text(name),
+            text(link),
+            text(macro),
+            part
         ))
 
-        for linkpart in s(link).split(";"):
-            target_sheet = self.target(
-                linkpart
-            )
+        for item in text(link).split(";"):
+            target_sheet = self.target(item)
 
             if target_sheet:
                 self.add(
                     sheet,
                     target_sheet,
                     "NAV",
-                    "SHAPE_HYPERLINK",
-                    s(ident),
-                    linkpart
+                    "SHAPE_LINK",
+                    ident,
+                    item
                 )
 
-    # --------------------------------------------------------
-    # XML relationships
-    # --------------------------------------------------------
-
-    def scan_xml(self):
+    def scan_shapes(self):
         print(
-            "[2/5] Drawing / VML / hyperlinks",
+            "[2/6] Scanning shapes",
             flush=True
         )
 
-        with zipfile.ZipFile(
-            self.source
-        ) as z:
+        with zipfile.ZipFile(self.path) as z:
             files = set(z.namelist())
 
-            workbook_rels = xmlrels(
+            workbook_rels = relationships(
                 z,
                 "xl/workbook.xml"
             )
 
-            root = ET.fromstring(
+            workbook_root = ET.fromstring(
                 z.read("xl/workbook.xml")
             )
 
-            for sh in root.iter():
+            for sh in workbook_root.iter():
                 if local(sh.tag) != "sheet":
                     continue
 
-                sheet = sh.get(
-                    "name",
-                    ""
-                )
-
                 relation = workbook_rels.get(
                     sh.get(
-                        "{" + REL_NS + "}id"
+                        "{" + RNS + "}id"
                     )
                 )
 
                 if not relation:
                     continue
 
-                part = partpath(
+                sheet = sh.get("name")
+
+                part = joinpart(
                     "xl/workbook.xml",
                     relation[1]
                 )
@@ -1015,28 +1152,27 @@ class Analyzer:
                 if part not in files:
                     continue
 
-                sheet_rels = xmlrels(
+                sheet_rels = relationships(
                     z,
                     part
                 )
 
-                root2 = ET.fromstring(
+                sheet_root = ET.fromstring(
                     z.read(part)
                 )
 
-                # Worksheet hyperlinks / controls
-                for el in root2.iter():
+                for el in sheet_root.iter():
                     tag = local(el.tag)
 
                     if tag == "hyperlink":
                         relation = sheet_rels.get(
                             el.get(
-                                "{" + REL_NS + "}id"
+                                "{" + RNS + "}id"
                             )
                         )
 
                         link = (
-                            el.get("location", "")
+                            el.get("location")
                             or (
                                 relation[1]
                                 if relation
@@ -1047,8 +1183,8 @@ class Analyzer:
                         self.shape(
                             sheet,
                             "CELL_LINK",
-                            el.get("ref", ""),
-                            el.get("display", ""),
+                            el.get("ref"),
+                            el.get("display"),
                             link,
                             "",
                             part
@@ -1064,21 +1200,21 @@ class Analyzer:
                         self.shape(
                             sheet,
                             tag,
-                            el.get("shapeId", ""),
-                            el.get("name", ""),
+                            el.get("shapeId"),
+                            el.get("name"),
                             "",
                             el.get("macro"),
                             part
                         )
 
-                done = set()
+                seen = set()
 
                 for rid, relation in (
                     sheet_rels.items()
                 ):
-                    kind, target, mode = relation
+                    typ, target, mode = relation
 
-                    if kind not in (
+                    if typ not in (
                         "drawing",
                         "vmlDrawing",
                         "ctrlProp",
@@ -1086,40 +1222,183 @@ class Analyzer:
                     ):
                         continue
 
-                    child = partpath(
+                    child = joinpart(
                         part,
                         target
                     )
 
                     if (
-                        child in done
-                        or child not in files
+                        child not in files
+                        or child in seen
                     ):
                         continue
 
-                    done.add(child)
+                    seen.add(child)
 
                     try:
-                        if kind == "drawing":
-                            self.drawing(
-                                z,
-                                sheet,
-                                child
-                            )
+                        root = ET.fromstring(
+                            z.read(child)
+                        )
 
-                        elif kind == "vmlDrawing":
-                            self.vml(
-                                z,
-                                sheet,
-                                child
-                            )
+                        drawing_rels = relationships(
+                            z,
+                            child
+                        )
+
+                        if typ == "drawing":
+                            for obj in root.iter():
+                                if local(obj.tag) not in (
+                                    "sp",
+                                    "pic",
+                                    "graphicFrame",
+                                    "cxnSp"
+                                ):
+                                    continue
+
+                                ident = ""
+                                name = ""
+                                macro = ""
+                                links = []
+
+                                for x in obj.iter():
+                                    tag = local(x.tag)
+
+                                    if tag == "cNvPr":
+                                        ident = x.get(
+                                            "id", ""
+                                        )
+                                        name = x.get(
+                                            "name", ""
+                                        )
+
+                                    macro = (
+                                        macro
+                                        or x.get("macro", "")
+                                        or x.get(
+                                            "onAction", ""
+                                        )
+                                    )
+
+                                    if tag in (
+                                        "hlinkClick",
+                                        "hlinkHover"
+                                    ):
+                                        relation = (
+                                            drawing_rels.get(
+                                                x.get(
+                                                    "{"
+                                                    + RNS
+                                                    + "}id"
+                                                )
+                                            )
+                                        )
+
+                                        if relation:
+                                            links.append(
+                                                relation[1]
+                                            )
+
+                                        for attr in (
+                                            "action",
+                                            "location"
+                                        ):
+                                            if x.get(attr):
+                                                links.append(
+                                                    x.get(attr)
+                                                )
+
+                                self.shape(
+                                    sheet,
+                                    local(obj.tag),
+                                    ident,
+                                    name,
+                                    ";".join(links),
+                                    macro,
+                                    child
+                                )
+
+                        elif typ == "vmlDrawing":
+                            for obj in root.iter():
+                                if local(obj.tag) != "shape":
+                                    continue
+
+                                ident = obj.get(
+                                    "id", ""
+                                )
+
+                                macro = obj.get(
+                                    "macro", ""
+                                )
+
+                                links = []
+
+                                for x in obj.iter():
+                                    tag = local(x.tag)
+
+                                    if (
+                                        tag in (
+                                            "FmlaMacro",
+                                            "Macro"
+                                        )
+                                        and text(
+                                            x.text
+                                        ).strip()
+                                    ):
+                                        macro = text(
+                                            x.text
+                                        ).strip()
+
+                                    if tag in (
+                                        "hlinkClick",
+                                        "hlinkHover"
+                                    ):
+                                        relation = (
+                                            drawing_rels.get(
+                                                x.get(
+                                                    "{"
+                                                    + RNS
+                                                    + "}id"
+                                                )
+                                            )
+                                        )
+
+                                        if relation:
+                                            links.append(
+                                                relation[1]
+                                            )
+
+                                self.shape(
+                                    sheet,
+                                    "VML",
+                                    ident,
+                                    ident,
+                                    ";".join(links),
+                                    macro,
+                                    child
+                                )
 
                         else:
-                            self.control(
-                                z,
-                                sheet,
-                                child
-                            )
+                            for obj in root.iter():
+                                macro = (
+                                    obj.get("macro")
+                                    or obj.get(
+                                        "fmlaMacro"
+                                    )
+                                    or obj.get(
+                                        "onAction"
+                                    )
+                                )
+
+                                if macro:
+                                    self.shape(
+                                        sheet,
+                                        "CONTROL",
+                                        obj.get("id"),
+                                        obj.get("name"),
+                                        "",
+                                        macro,
+                                        child
+                                    )
 
                     except Exception as exc:
                         self.unresolved.append((
@@ -1131,234 +1410,498 @@ class Analyzer:
                         ))
 
     # --------------------------------------------------------
-    # DrawingML
+    # PivotTable source analysis
     # --------------------------------------------------------
 
-    def drawing(
-        self,
-        z,
-        sheet,
-        part
-    ):
-        root = ET.fromstring(
-            z.read(part)
+    def scan_pivots(self):
+        print(
+            "[3/6] Scanning PivotTables",
+            flush=True
         )
 
-        drawing_rels = xmlrels(
-            z,
-            part
-        )
+        with zipfile.ZipFile(self.path) as z:
+            files = set(z.namelist())
 
-        for el in root.iter():
-            if local(el.tag) not in (
-                "sp",
-                "pic",
-                "graphicFrame",
-                "cxnSp"
-            ):
-                continue
+            workbook_part = "xl/workbook.xml"
 
-            ident = ""
-            name = ""
-            macro = ""
+            workbook_rels = relationships(
+                z,
+                workbook_part
+            )
 
-            links = []
-            notes = []
+            workbook_root = ET.fromstring(
+                z.read(workbook_part)
+            )
 
-            for x in el.iter():
-                tag = local(x.tag)
+            cache_parts = {}
 
-                if tag == "cNvPr":
-                    ident = x.get(
-                        "id",
-                        ident
-                    )
+            for item in workbook_root.iter():
+                if local(item.tag) != "pivotCache":
+                    continue
 
-                    name = x.get(
-                        "name",
-                        name
-                    )
-
-                    description = x.get(
-                        "descr",
-                        ""
-                    )
-
-                    if description:
-                        notes.append(description)
-
-                macro = (
-                    macro
-                    or x.get("macro", "")
-                    or x.get("onAction", "")
+                cache_id = item.get(
+                    "cacheId", ""
                 )
 
-                if tag in (
-                    "hlinkClick",
-                    "hlinkHover"
-                ):
-                    relation = drawing_rels.get(
-                        x.get(
-                            "{" + REL_NS + "}id"
-                        )
+                rel_id = item.get(
+                    "{" + RNS + "}id"
+                )
+
+                relation = workbook_rels.get(
+                    rel_id
+                )
+
+                if relation:
+                    cache_parts[
+                        cache_id
+                    ] = joinpart(
+                        workbook_part,
+                        relation[1]
                     )
 
-                    if relation:
-                        # Preserve #Sheet!A1 literally.
-                        links.append(
-                            relation[1]
-                        )
+            cache_info = {}
 
-                    if x.get("action"):
-                        links.append(
-                            x.get("action")
-                        )
+            def read_cache(part):
+                if part in cache_info:
+                    return cache_info[part]
 
-                    if x.get("location"):
-                        links.append(
-                            x.get("location")
-                        )
-
-            self.shape(
-                sheet,
-                local(el.tag),
-                ident,
-                name,
-                ";".join(links),
-                macro,
-                part,
-                ";".join(notes)
-            )
-
-    # --------------------------------------------------------
-    # VML
-    # --------------------------------------------------------
-
-    def vml(
-        self,
-        z,
-        sheet,
-        part
-    ):
-        root = ET.fromstring(
-            z.read(part)
-        )
-
-        drawing_rels = xmlrels(
-            z,
-            part
-        )
-
-        for el in root.iter():
-            if local(el.tag) != "shape":
-                continue
-
-            ident = el.get(
-                "id",
-                ""
-            )
-
-            macro = el.get(
-                "macro",
-                ""
-            )
-
-            links = []
-            notes = []
-
-            kind = "VML"
-
-            for x in el.iter():
-                tag = local(x.tag)
-
-                if (
-                    tag in (
-                        "FmlaMacro",
-                        "Macro"
-                    )
-                    and s(x.text).strip()
-                ):
-                    macro = s(x.text).strip()
-
-                if tag == "ClientData":
-                    kind = (
-                        "VML:"
-                        + x.get(
-                            "ObjectType",
-                            ""
-                        )
-                    )
-
-                if tag in (
-                    "FmlaLink",
-                    "FmlaRange"
-                ):
-                    notes.append(
-                        tag + ":" + s(x.text)
-                    )
-
-                if tag in (
-                    "hlinkClick",
-                    "hlinkHover"
-                ):
-                    relation = drawing_rels.get(
-                        x.get(
-                            "{" + REL_NS + "}id"
-                        )
-                    )
-
-                    if relation:
-                        links.append(
-                            relation[1]
-                        )
-
-                    if x.get("action"):
-                        links.append(
-                            x.get("action")
-                        )
-
-            self.shape(
-                sheet,
-                kind,
-                ident,
-                ident,
-                ";".join(links),
-                macro,
-                part,
-                ";".join(notes)
-            )
-
-    # --------------------------------------------------------
-    # Control XML
-    # --------------------------------------------------------
-
-    def control(
-        self,
-        z,
-        sheet,
-        part
-    ):
-        root = ET.fromstring(
-            z.read(part)
-        )
-
-        for el in root.iter():
-            macro = (
-                el.get("macro")
-                or el.get("fmlaMacro")
-                or el.get("onAction")
-            )
-
-            if macro:
-                self.shape(
-                    sheet,
-                    "CONTROL",
-                    el.get("id", ""),
-                    el.get("name", ""),
+                info = (
+                    "UNRESOLVED",
                     "",
-                    macro,
-                    part
+                    "",
+                    "",
+                    ""
                 )
+
+                if part in files:
+                    try:
+                        root = ET.fromstring(
+                            z.read(part)
+                        )
+
+                        for node in root.iter():
+                            if (
+                                local(node.tag)
+                                != "cacheSource"
+                            ):
+                                continue
+
+                            source_type = node.get(
+                                "type", ""
+                            )
+
+                            worksheet_source = next(
+                                (
+                                    child
+                                    for child in node
+                                    if local(
+                                        child.tag
+                                    ) == "worksheetSource"
+                                ),
+                                None
+                            )
+
+                            if worksheet_source is not None:
+                                info = (
+                                    source_type,
+                                    worksheet_source.get(
+                                        "sheet", ""
+                                    ),
+                                    worksheet_source.get(
+                                        "ref", ""
+                                    ),
+                                    worksheet_source.get(
+                                        "name", ""
+                                    ),
+                                    ""
+                                )
+
+                            else:
+                                info = (
+                                    source_type,
+                                    "",
+                                    "",
+                                    "",
+                                    "No worksheetSource"
+                                )
+
+                            break
+
+                    except Exception as exc:
+                        info = (
+                            "ERROR",
+                            "",
+                            "",
+                            "",
+                            repr(exc)
+                        )
+
+                cache_info[part] = info
+
+                return info
+
+            for sh in workbook_root.iter():
+                if local(sh.tag) != "sheet":
+                    continue
+
+                sheet = sh.get(
+                    "name", ""
+                )
+
+                relation = workbook_rels.get(
+                    sh.get(
+                        "{" + RNS + "}id"
+                    )
+                )
+
+                if not relation:
+                    continue
+
+                sheet_part = joinpart(
+                    workbook_part,
+                    relation[1]
+                )
+
+                if sheet_part not in files:
+                    continue
+
+                sheet_rels = relationships(
+                    z,
+                    sheet_part
+                )
+
+                for rid, relation in (
+                    sheet_rels.items()
+                ):
+                    typ, target, mode = relation
+
+                    if typ != "pivotTable":
+                        continue
+
+                    pivot_part = joinpart(
+                        sheet_part,
+                        target
+                    )
+
+                    if pivot_part not in files:
+                        self.unresolved.append((
+                            sheet,
+                            pivot_part,
+                            "PIVOT",
+                            "",
+                            "Missing pivot definition"
+                        ))
+                        continue
+
+                    try:
+                        root = ET.fromstring(
+                            z.read(pivot_part)
+                        )
+
+                        pivot_name = root.get(
+                            "name", ""
+                        )
+
+                        cache_id = root.get(
+                            "cacheId", ""
+                        )
+
+                        cache_part = ""
+
+                        pivot_rels = relationships(
+                            z,
+                            pivot_part
+                        )
+
+                        for rel in pivot_rels.values():
+                            if (
+                                rel[0]
+                                == "pivotCacheDefinition"
+                            ):
+                                cache_part = joinpart(
+                                    pivot_part,
+                                    rel[1]
+                                )
+                                break
+
+                        if not cache_part:
+                            cache_part = (
+                                cache_parts.get(
+                                    cache_id,
+                                    ""
+                                )
+                            )
+
+                        (
+                            source_type,
+                            source_sheet,
+                            source_ref,
+                            source_name,
+                            issue
+                        ) = read_cache(cache_part)
+
+                        target_sheet = self.canon(
+                            source_sheet
+                        )
+
+                        status = "UNRESOLVED"
+
+                        if source_type != "worksheet":
+                            issue = (
+                                issue
+                                + "; External/connection/"
+                                "model source"
+                            )
+
+                        elif (
+                            source_sheet
+                            and not target_sheet
+                        ):
+                            issue = (
+                                issue
+                                + "; Source sheet "
+                                "not found"
+                            )
+
+                        if (
+                            source_type == "worksheet"
+                            and target_sheet
+                        ):
+                            status = "CONFIRMED"
+
+                            self.add(
+                                sheet,
+                                target_sheet,
+                                "DATA",
+                                "PIVOT_SOURCE",
+                                pivot_name,
+                                (
+                                    "Pivot "
+                                    + pivot_name
+                                    + " source="
+                                    + source_sheet
+                                    + "!"
+                                    + source_ref
+                                )
+                            )
+
+                        elif (
+                            source_type == "worksheet"
+                            and source_name
+                        ):
+                            expression = (
+                                self.definitions.get(
+                                    source_name.casefold(),
+                                    ""
+                                )
+                            )
+
+                            if not expression:
+                                local_names = (
+                                    self.wf[
+                                        sheet
+                                    ].defined_names
+                                )
+
+                                for key, definition in (
+                                    local_names.items()
+                                ):
+                                    if (
+                                        key.casefold()
+                                        == source_name.casefold()
+                                    ):
+                                        expression = text(
+                                            definition.attr_text
+                                        )
+                                        break
+
+                            if expression:
+                                target_sheet = self.target(
+                                    expression
+                                )
+
+                            if target_sheet:
+                                status = "CONFIRMED_NAME"
+
+                                self.add(
+                                    sheet,
+                                    target_sheet,
+                                    "DATA",
+                                    "PIVOT_NAMED_SOURCE",
+                                    pivot_name,
+                                    (
+                                        source_name
+                                        + " -> "
+                                        + expression
+                                    )
+                                )
+
+                            else:
+                                matches = self._table_sources(
+                                    z,
+                                    files,
+                                    source_name
+                                )
+
+                                if len(matches) == 1:
+                                    target_sheet = matches[0]
+                                    status = "CONFIRMED_TABLE"
+
+                                    self.add(
+                                        sheet,
+                                        target_sheet,
+                                        "DATA",
+                                        "PIVOT_TABLE_SOURCE",
+                                        pivot_name,
+                                        source_name
+                                    )
+
+                                elif len(matches) > 1:
+                                    status = "AMBIGUOUS_TABLE"
+
+                                    for candidate in matches:
+                                        self.add(
+                                            sheet,
+                                            candidate,
+                                            "DATA",
+                                            "PIVOT_TABLE_CANDIDATE",
+                                            pivot_name,
+                                            source_name,
+                                            False
+                                        )
+
+                        self.pivots.append((
+                            sheet,
+                            pivot_name,
+                            cache_id,
+                            source_type,
+                            source_sheet,
+                            source_ref,
+                            source_name,
+                            target_sheet or "",
+                            status,
+                            cache_part,
+                            issue
+                        ))
+
+                        self.stats["PivotTables"] += 1
+
+                        if (
+                            status.startswith("UNRESOLVED")
+                            or status == "AMBIGUOUS_TABLE"
+                        ):
+                            self.unresolved.append((
+                                sheet,
+                                pivot_name,
+                                "PIVOT",
+                                source_name or source_ref,
+                                (
+                                    "Source unresolved: "
+                                    + source_type
+                                    + "; "
+                                    + issue
+                                )
+                            ))
+
+                    except Exception as exc:
+                        self.unresolved.append((
+                            sheet,
+                            pivot_part,
+                            "PIVOT",
+                            "",
+                            repr(exc)
+                        ))
+
+            print(
+                "  Pivot tables:",
+                self.stats["PivotTables"],
+                flush=True
+            )
+
+    def _table_sources(
+        self,
+        z,
+        files,
+        table_name
+    ):
+        found = set()
+
+        workbook_part = "xl/workbook.xml"
+
+        workbook_rels = relationships(
+            z,
+            workbook_part
+        )
+
+        root = ET.fromstring(
+            z.read(workbook_part)
+        )
+
+        for sh in root.iter():
+            if local(sh.tag) != "sheet":
+                continue
+
+            relation = workbook_rels.get(
+                sh.get(
+                    "{" + RNS + "}id"
+                )
+            )
+
+            if not relation:
+                continue
+
+            part = joinpart(
+                workbook_part,
+                relation[1]
+            )
+
+            if part not in files:
+                continue
+
+            for rel in relationships(
+                z,
+                part
+            ).values():
+                kind, target, mode = rel
+
+                if kind != "table":
+                    continue
+
+                table_part = joinpart(
+                    part,
+                    target
+                )
+
+                if table_part not in files:
+                    continue
+
+                try:
+                    table = ET.fromstring(
+                        z.read(table_part)
+                    )
+
+                    display_name = table.get(
+                        "displayName", ""
+                    )
+
+                    name = table.get(
+                        "name", ""
+                    )
+
+                    if (
+                        display_name.casefold()
+                        == table_name.casefold()
+                        or name.casefold()
+                        == table_name.casefold()
+                    ):
+                        found.add(
+                            sh.get("name", "")
+                        )
+
+                except Exception:
+                    pass
+
+        return sorted(found)
 
     # --------------------------------------------------------
     # VBA analysis
@@ -1366,14 +1909,12 @@ class Analyzer:
 
     def scan_vba(self):
         print(
-            "[3/5] VBA macro analysis",
+            "[4/6] Scanning VBA",
             flush=True
         )
 
         try:
-            from oletools.olevba import (
-                VBA_Parser
-            )
+            from oletools.olevba import VBA_Parser
 
         except ImportError:
             self.unresolved.append((
@@ -1381,10 +1922,7 @@ class Analyzer:
                 "VBA",
                 "VBA",
                 "",
-                (
-                    "Install oletools: "
-                    "pip install oletools"
-                )
+                "Install oletools"
             ))
             return
 
@@ -1392,7 +1930,7 @@ class Analyzer:
 
         try:
             parser = VBA_Parser(
-                str(self.source)
+                str(self.path)
             )
 
             if parser.detect_vba_macros():
@@ -1410,7 +1948,7 @@ class Analyzer:
                         )
 
                     matches = list(
-                        VBA_PROC.finditer(code)
+                        PROC.finditer(code)
                     )
 
                     for i, match in enumerate(
@@ -1426,24 +1964,12 @@ class Analyzer:
                             match.start():end
                         ]
 
-                        name = match.group(1)
-
                         self.procs[
-                            name.casefold()
+                            match.group(1).casefold()
                         ].append((
                             module,
                             body
                         ))
-
-                        for ref in (
-                            VBA_SHEET.finditer(body)
-                        ):
-                            self.vba_refs.append((
-                                module,
-                                name,
-                                ref.group(1),
-                                body[:700]
-                            ))
 
         except Exception as exc:
             self.unresolved.append((
@@ -1461,7 +1987,6 @@ class Analyzer:
                 except Exception:
                     pass
 
-        # Trace each shape's assigned macro.
         for shape in self.shapes:
             (
                 sheet,
@@ -1470,8 +1995,7 @@ class Analyzer:
                 name,
                 link,
                 macro,
-                part,
-                note
+                part
             ) = shape
 
             if not macro:
@@ -1486,22 +2010,20 @@ class Analyzer:
                 .casefold()
             )
 
-            visited = set()
+            seen = set()
 
-            destinations = (
-                collections.defaultdict(set)
+            targets = collections.defaultdict(
+                set
             )
-
-            found = []
 
             def walk(procname, depth=0):
                 if (
                     depth > 10
-                    or procname in visited
+                    or procname in seen
                 ):
                     return
 
-                visited.add(procname)
+                seen.add(procname)
 
                 for module, body in (
                     self.procs.get(
@@ -1509,49 +2031,29 @@ class Analyzer:
                         []
                     )
                 ):
-                    found.append(
-                        module + ":" + procname
-                    )
-
                     for line in body.splitlines():
                         if line.lstrip().startswith("'"):
                             continue
 
-                        refs = list(
-                            VBA_SHEET.finditer(line)
-                        )
-
-                        if refs:
-                            navigation = bool(
-                                VBA_GOTO.search(line)
+                        for match in VREF.finditer(
+                            line
+                        ):
+                            dst = self.canon(
+                                match.group(1)
                             )
 
-                            for ref in refs:
-                                target_sheet = (
-                                    self.canon(
-                                        ref.group(1)
-                                    )
+                            if dst:
+                                targets[dst].add(
+                                    "NAV"
+                                    if NAV.search(line)
+                                    else "REFERENCE"
                                 )
 
-                                if target_sheet:
-                                    destinations[
-                                        target_sheet
-                                    ].add(
-                                        "NAV"
-                                        if navigation
-                                        else "REFERENCE"
-                                    )
-
-                        # Follow simple procedure calls.
-                        stripped = (
-                            line.strip()
-                            .split("'", 1)[0]
-                        )
-
                         match = re.match(
-                            r"(?i)^(?:Call\s+)?"
+                            r"(?i)^\s*"
+                            r"(?:Call\s+)?"
                             r"([A-Za-z_]\w*)\b",
-                            stripped
+                            line
                         )
 
                         if match:
@@ -1568,78 +2070,54 @@ class Analyzer:
 
             walk(proc)
 
-            if not found:
-                self.macro_routes.append((
+            if not targets:
+                self.routes.append((
                     sheet,
                     ident,
                     name,
                     macro,
                     "",
                     "UNRESOLVED",
-                    "Macro procedure not found",
-                    ""
+                    "Macro/target not resolved"
                 ))
-                continue
 
-            if not destinations:
-                self.macro_routes.append((
-                    sheet,
-                    ident,
-                    name,
-                    macro,
-                    "",
-                    "UNRESOLVED",
-                    (
-                        "No static "
-                        'Sheets("...") target'
-                    ),
-                    ";".join(found)
-                ))
-                continue
+            for dst, kinds in targets.items():
+                status = (
+                    "POSSIBLE_NAV"
+                    if "NAV" in kinds
+                    else "REFERENCE_ONLY"
+                )
 
-            for target_sheet, types in sorted(
-                destinations.items()
-            ):
-                if "NAV" in types:
-                    status = "POSSIBLE_NAV"
-
+                if "NAV" in kinds:
                     self.add(
                         sheet,
-                        target_sheet,
+                        dst,
                         "NAV",
-                        "VBA_NAV_CANDIDATE",
+                        "VBA_CANDIDATE",
                         ident,
-                        (
-                            macro
-                            + " via "
-                            + ";".join(found)
-                        ),
+                        macro,
                         False
                     )
 
-                else:
-                    status = (
-                        "SHEET_REFERENCE_ONLY"
-                    )
-
-                self.macro_routes.append((
+                self.routes.append((
                     sheet,
                     ident,
                     name,
                     macro,
-                    target_sheet,
+                    dst,
                     status,
-                    ",".join(sorted(types)),
-                    ";".join(found)
+                    ",".join(
+                        sorted(kinds)
+                    )
                 ))
 
     # --------------------------------------------------------
     # Streaming report
     # --------------------------------------------------------
 
-    def write(self, output):
+    def report(self, output):
         print(
-            "[4/5] Streaming report",
+            "[5/6] Streaming report",
             flush=True
         )
 
@@ -1650,7 +2128,11 @@ class Analyzer:
             write_only=True
         )
 
-        def tab(name, headers, rows):
+        def tab(
+            name,
+            headers,
+            rows
+        ):
             start = time.perf_counter()
 
             print(
@@ -1706,6 +2188,7 @@ class Analyzer:
                     values.append(value)
 
                 ws.append(values)
+
                 count += 1
 
                 if count % 10000 == 0:
@@ -1722,8 +2205,8 @@ class Analyzer:
 
             print(
                 f"  [DONE] {name}: "
-                f"{count:,} rows "
-                f"({elapsed:.1f}s)",
+                f"{count:,} rows, "
+                f"{elapsed:.1f}s",
                 flush=True
             )
 
@@ -1732,68 +2215,50 @@ class Analyzer:
             "Summary",
             ["Metric", "Value"],
             [
+                ("Source", str(self.path)),
+                ("Sheets", len(self.names)),
+                ("Formulas", self.stats["Formulas"]),
+                ("INDIRECT", self.stats["INDIRECT"]),
                 (
-                    "Source",
-                    str(self.source)
+                    "INDIRECT resolved",
+                    sum(
+                        r[5] == "RESOLVED"
+                        for r in self.indirect_debug
+                    )
+                ),
+                ("OFFSET", self.stats["OFFSET"]),
+                ("Data confirmed", len(self.data)),
+                ("Data possible", len(self.maybe_data)),
+                ("Navigation confirmed", len(self.nav)),
+                ("Navigation possible", len(self.maybe_nav)),
+                ("Shapes", len(self.shapes)),
+                (
+                    "Pivot tables",
+                    self.stats["PivotTables"]
                 ),
                 (
-                    "Sheets",
-                    len(self.names)
+                    "Pivot confirmed",
+                    sum(
+                        r[8].startswith("CONFIRMED")
+                        for r in self.pivots
+                    )
                 ),
                 (
-                    "Formulas",
-                    self.stats["Formulas"]
+                    "Pivot unresolved",
+                    sum(
+                        not r[8].startswith("CONFIRMED")
+                        for r in self.pivots
+                    )
                 ),
-                (
-                    "INDIRECT",
-                    self.stats["INDIRECT"]
-                ),
-                (
-                    "OFFSET",
-                    self.stats["OFFSET"]
-                ),
-                (
-                    "Data confirmed pairs",
-                    len(self.data)
-                ),
-                (
-                    "Data possible pairs",
-                    len(self.maybe_data)
-                ),
-                (
-                    "Navigation confirmed pairs",
-                    len(self.nav)
-                ),
-                (
-                    "Navigation possible pairs",
-                    len(self.maybe_nav)
-                ),
-                (
-                    "Shape records",
-                    len(self.shapes)
-                ),
-                (
-                    "Macro routes",
-                    len(self.macro_routes)
-                ),
-                (
-                    "Unresolved records",
-                    len(self.unresolved)
-                ),
-                (
-                    "Evidence records",
-                    len(self.evidence)
-                )
+                ("Macro routes", len(self.routes)),
+                ("Unresolved", len(self.unresolved))
             ]
         )
 
         # Sheet inventory
         tab(
             "Sheets",
-            [
-                "Sheet",
-                "Visibility"
-            ],
+            ["Sheet", "Visibility"],
             (
                 (
                     name,
@@ -1803,35 +2268,28 @@ class Analyzer:
             )
         )
 
-        # Matrix generator
-        def matrix(
-            name,
-            confirmed,
-            possible
-        ):
-            def rows():
-                for src in self.names:
-                    values = [src]
-
-                    for dst in self.names:
-                        pair = (src, dst)
-
-                        if pair in confirmed:
-                            values.append(1)
-
-                        elif pair in possible:
-                            values.append("?")
-
-                        else:
-                            values.append(0)
-
-                    yield values
+        # Dependency matrices
+        def matrix(name, yes, maybe):
+            rows = (
+                [src] + [
+                    (
+                        1
+                        if (src, dst) in yes
+                        else (
+                            "?"
+                            if (src, dst) in maybe
+                            else 0
+                        )
+                    )
+                    for dst in self.names
+                ]
+                for src in self.names
+            )
 
             tab(
                 name,
-                ["Source / Target"]
-                + self.names,
-                rows()
+                ["Source / Target"] + self.names,
+                rows
             )
 
         matrix(
@@ -1846,22 +2304,22 @@ class Analyzer:
             self.maybe_nav
         )
 
-        union = (
+        combined_yes = (
             self.data | self.nav
         )
 
-        possible_union = (
+        combined_maybe = (
             self.maybe_data
             | self.maybe_nav
-        ) - union
+        ) - combined_yes
 
         matrix(
             "Combined_Matrix",
-            union,
-            possible_union
+            combined_yes,
+            combined_maybe
         )
 
-        # Evidence
+        # Detailed audit sheets
         tab(
             "Evidence",
             [
@@ -1876,12 +2334,11 @@ class Analyzer:
             self.evidence
         )
 
-        # Unresolved
         tab(
             "Unresolved",
             [
                 "Sheet",
-                "Cell/Object",
+                "Cell",
                 "Type",
                 "Formula",
                 "Reason"
@@ -1889,23 +2346,53 @@ class Analyzer:
             self.unresolved
         )
 
-        # Shape links
+        tab(
+            "INDIRECT_Debug",
+            [
+                "Sheet",
+                "Cell",
+                "Expression",
+                "Evaluated",
+                "Target Sheet",
+                "Status",
+                "J6",
+                "K6"
+            ],
+            self.indirect_debug
+        )
+
         tab(
             "Shapes_Links",
             [
                 "Sheet",
-                "ObjectType",
+                "Type",
                 "ID",
                 "Name",
                 "Link",
                 "Macro",
-                "Part",
-                "Detail"
+                "Part"
             ],
             self.shapes
         )
 
-        # VBA macro routes
+        tab(
+            "Pivot_Audit",
+            [
+                "Pivot Sheet",
+                "Pivot Name",
+                "Cache ID",
+                "Source Type",
+                "Source Sheet",
+                "Source Range",
+                "Source Name/Table",
+                "Resolved Sheet",
+                "Status",
+                "Cache Definition Part",
+                "Detail"
+            ],
+            self.pivots
+        )
+
         tab(
             "Macro_Routes",
             [
@@ -1915,116 +2402,78 @@ class Analyzer:
                 "Macro",
                 "Target",
                 "Status",
-                "Reason",
-                "Procedures"
+                "Reason"
             ],
-            self.macro_routes
-        )
-
-        # VBA references
-        tab(
-            "VBA_References",
-            [
-                "Module",
-                "Procedure",
-                "Sheet",
-                "Code excerpt"
-            ],
-            self.vba_refs
-        )
-
-        # INDIRECT diagnostics
-        tab(
-            "INDIRECT_Debug",
-            [
-                "Sheet",
-                "Cell",
-                "Type",
-                "Expression",
-                "Value",
-                "E36 value"
-            ],
-            self.debug
+            self.routes
         )
 
         # TOP button audit
         def top_rows():
-            for shape in self.shapes:
-                if shape[0].casefold() != "top":
+            for row in self.shapes:
+                if row[0].casefold() != "top":
                     continue
 
-                routes = [
+                matched = [
                     route
-                    for route in self.macro_routes
+                    for route in self.routes
                     if (
-                        route[0] == shape[0]
-                        and route[1] == shape[2]
+                        route[0] == row[0]
+                        and route[1] == row[2]
                     )
                 ]
 
                 targets = sorted({
                     route[4]
-                    for route in routes
+                    for route in matched
                     if route[4]
                 })
 
                 statuses = sorted({
                     route[5]
-                    for route in routes
+                    for route in matched
                 })
 
-                if not statuses:
-                    statuses = [
-                        "LINK"
-                        if shape[4]
-                        else "UNRESOLVED"
-                    ]
-
                 yield (
-                    shape[2],
-                    shape[3],
-                    shape[1],
-                    shape[5],
-                    shape[4],
-                    "; ".join(targets),
-                    "; ".join(statuses),
-                    shape[6]
+                    row[2],
+                    row[3],
+                    row[1],
+                    row[5],
+                    row[4],
+                    ";".join(targets),
+                    ";".join(statuses)
                 )
 
         tab(
             "TOP_Button_Audit",
             [
-                "Object ID",
+                "ID",
                 "Name",
                 "Type",
                 "Macro",
                 "Link",
                 "Targets",
-                "Status",
-                "Part"
+                "Status"
             ],
             top_rows()
         )
 
         # Regression checks
-        src = self.canon("サマリ")
-
-        dst = self.canon(
-            "1023951_I_STAR現行売上"
+        pair = (
+            self.canon("サマリ"),
+            self.canon(
+                "1023951_I_STAR現行売上"
+            )
         )
 
-        pair = (src, dst)
-
-        if pair in self.data:
-            check = "PASS"
-
-        elif pair in self.maybe_data:
-            check = "POSSIBLE"
-
-        else:
-            check = "NOT_RESOLVED"
-
-        top = self.canon("TOP")
+        check = (
+            "PASS"
+            if pair in self.data
+            else (
+                "POSSIBLE"
+                if pair in self.maybe_data
+                else "NOT_RESOLVED"
+            )
+        )
 
         tab(
             "Regression_Check",
@@ -2038,52 +2487,55 @@ class Analyzer:
                     "サマリ → "
                     "1023951_I_STAR現行売上",
                     check,
-                    "Data reference"
+                    "Confirmed data dependency"
                 ),
                 (
                     "サマリ!E36",
                     repr(
-                        self.getcell(
+                        self.cellvalue(
                             "サマリ",
                             "E36"
                         )
                     ),
-                    "Resolved source value"
+                    "Source value"
                 ),
                 (
                     "TOP shapes",
                     sum(
-                        shape[0] == top
-                        for shape in self.shapes
+                        r[0].casefold() == "top"
+                        for r in self.shapes
                     ),
-                    "Drawing/VML objects"
+                    "Objects"
                 ),
                 (
                     "TOP macro bindings",
                     sum(
-                        shape[0] == top
-                        and bool(shape[5])
-                        for shape in self.shapes
+                        r[0].casefold() == "top"
+                        and bool(r[5])
+                        for r in self.shapes
                     ),
-                    "Bound macros"
+                    "Macro objects"
                 ),
                 (
                     "TOP confirmed navigation",
                     sum(
-                        source == top
-                        for source, target
-                        in self.nav
+                        src.casefold() == "top"
+                        for src, dst in self.nav
                     ),
-                    "Direct hyperlinks"
+                    "Direct links"
                 ),
                 (
                     "TOP possible navigation",
                     sum(
-                        source == top
-                        for source, target
-                        in self.maybe_nav
+                        src.casefold() == "top"
+                        for src, dst in self.maybe_nav
                     ),
-                    "Macro candidates"
+                    "VBA candidates"
+                ),
+                (
+                    "Pivot tables",
+                    self.stats["PivotTables"],
+                    "Pivot source relations"
                 )
             ]
         )
@@ -2091,80 +2543,71 @@ class Analyzer:
         # README
         tab(
             "README",
-            [
-                "Field",
-                "Meaning"
-            ],
+            ["Item", "Meaning"],
             [
                 (
                     "1",
-                    "Confirmed formula reference "
-                    "or direct hyperlink"
+                    "Confirmed static dependency"
                 ),
                 (
                     "?",
-                    "Possible relationship; "
-                    "not verified execution"
+                    "Possible dependency, not proven"
                 ),
                 (
                     "0",
                     "No evidence found; "
-                    "NOT proof of absence"
+                    "not proof of absence"
                 ),
                 (
                     "Data_Matrix",
-                    "Formula dependencies"
+                    "Data and formula dependencies"
                 ),
                 (
                     "Navigation_Matrix",
-                    "Hyperlinks and macro "
-                    "navigation candidates"
+                    "Hyperlinks and VBA candidates"
                 ),
                 (
                     "Combined_Matrix",
-                    "Data and navigation"
-                ),
-                (
-                    "TOP_Button_Audit",
-                    "Detected TOP objects "
-                    "and assigned macros"
+                    "Combined relationships"
                 ),
                 (
                     "INDIRECT_Debug",
-                    "Dynamic reference diagnostics"
+                    "Evaluated INDIRECT expressions"
                 ),
                 (
-                    "Source workbook",
-                    "Never overwritten"
+                    "Pivot_Audit",
+                    "Pivot sheet to source sheet"
+                ),
+                (
+                    "Source",
+                    "Never modified"
                 ),
                 (
                     "VBA",
-                    "Static inspection only"
+                    "Macros are never executed"
                 )
             ]
         )
 
-        # Save
         print(
-            "[5/5] Saving XLSX...",
+            "[6/6] Saving XLSX...",
             flush=True
         )
-
-        start = time.perf_counter()
 
         wb.save(output)
 
         print(
-            f"[DONE] {output} "
-            f"({time.perf_counter() - start:.1f}s)",
+            "[DONE]",
+            output,
             flush=True
         )
-
-        return check
 
     def close(self):
         self.wf.close()
         self.wv.close()
+
+        if self._temp:
+            self._temp.cleanup()
 
 
 # ============================================================
@@ -2196,44 +2639,31 @@ def main():
         or not zipfile.is_zipfile(source)
     ):
         parser.error(
-            "Invalid XLSX/XLSM input"
+            "Invalid XLSM/XLSX file"
         )
 
-    if args.output:
-        output = Path(
-            args.output
-        ).resolve()
-
-    else:
-        output = source.with_name(
+    output = (
+        Path(args.output).resolve()
+        if args.output
+        else source.with_name(
             source.stem
-            + "_dependency_report_v6.xlsx"
+            + "_dependency_report_v6_3.xlsx"
         )
+    )
 
     if output == source:
         parser.error(
-            "Output must not equal input"
+            "Output cannot overwrite input"
         )
-
-    print(
-        "Input:",
-        source,
-        flush=True
-    )
-
-    print(
-        "Output:",
-        output,
-        flush=True
-    )
 
     start = time.perf_counter()
 
-    audit = Analyzer(source)
+    audit = Audit(source)
 
     try:
         audit.scan_formulas()
-        audit.scan_xml()
+        audit.scan_shapes()
+        audit.scan_pivots()
         audit.scan_vba()
 
         output.parent.mkdir(
@@ -2241,28 +2671,18 @@ def main():
             exist_ok=True
         )
 
-        status = audit.write(output)
-
-        elapsed = (
-            time.perf_counter()
-            - start
-        )
-
-        print()
-        print("=" * 60)
-        print("FINISHED")
-        print("=" * 60)
+        audit.report(output)
 
         print(
-            f"Elapsed: {elapsed:.1f}s"
-        )
-
-        print(
-            f"Regression: {status}"
-        )
-
-        print(
-            f"Output: {output}"
+            "FINISHED in "
+            + str(
+                round(
+                    time.perf_counter() - start,
+                    1
+                )
+            )
+            + "s",
+            flush=True
         )
 
     finally:
@@ -2270,12 +2690,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-
-    except KeyboardInterrupt:
-        print(
-            "Interrupted",
-            file=sys.stderr
-        )
-        sys.exit(130)
+    main()
