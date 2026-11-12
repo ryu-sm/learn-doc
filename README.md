@@ -1,3 +1,18 @@
+
+SELECT
+    V('APP_USER') AS APP_USER,
+    V('G_FULL_NAME') AS FULL_NAME,
+    V('G_GIVEN_NAME') AS GIVEN_NAME,
+    V('G_FAMILY_NAME') AS FAMILY_NAME,
+    V('G_EMAIL') AS EMAIL
+FROM DUAL;
+
+
+
+
+
+
+
 本日は、APEXの個人開発環境の構築を完了し、APEXの基本的な機能や操作方法について理解を深めました。
 
 実際に触れてみたところ、APEXの操作自体はそれほど難しくないと感じました。今後は、業務知識やシステム全体の理解を深めることが、開発を進める上でより重要になると考えています。
