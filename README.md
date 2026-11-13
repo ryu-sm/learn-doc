@@ -1,4 +1,52 @@
 
+
+import ctypes
+import time
+from datetime import datetime
+
+# Windows 电源管理标志
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+ES_DISPLAY_REQUIRED = 0x00000002
+
+kernel32 = ctypes.windll.kernel32
+
+def keep_awake():
+    result = kernel32.SetThreadExecutionState(
+        ES_CONTINUOUS |
+        ES_SYSTEM_REQUIRED |
+        ES_DISPLAY_REQUIRED
+    )
+
+    if result == 0:
+        raise ctypes.WinError()
+
+def restore_power_settings():
+    kernel32.SetThreadExecutionState(
+        ES_CONTINUOUS
+    )
+
+if __name__ == "__main__":
+    try:
+        keep_awake()
+        print("Windows 防休眠模式已启动")
+
+        while True:
+            print(
+                datetime.now().strftime("%H:%M:%S"),
+                "电脑保持唤醒状态"
+            )
+            time.sleep(60)
+
+    except KeyboardInterrupt:
+        print("正在退出...")
+
+    finally:
+        restore_power_settings()
+        print("已恢复 Windows 默认电源管理")
+
+
+
 11月12日報（劉春明）
 
 本日の作業内容
