@@ -1,4 +1,69 @@
 
+import pyautogui
+import time
+from datetime import datetime
+
+# 每隔多少秒移动一次
+INTERVAL = 60
+
+# 鼠标移动距离（像素）
+MOVE_DISTANCE = 20
+
+# 鼠标移动时间（秒）
+MOVE_DURATION = 0.5
+
+pyautogui.FAILSAFE = True
+
+def simulate_mouse():
+    x, y = pyautogui.position()
+
+    screen_width, screen_height = pyautogui.size()
+
+    # 避免移动到屏幕边缘
+    if x + MOVE_DISTANCE < screen_width:
+        target_x = x + MOVE_DISTANCE
+    else:
+        target_x = x - MOVE_DISTANCE
+
+    # 向右或向左移动
+    pyautogui.moveTo(
+        target_x,
+        y,
+        duration=MOVE_DURATION
+    )
+
+    # 移动回原位置
+    pyautogui.moveTo(
+        x,
+        y,
+        duration=MOVE_DURATION
+    )
+
+def main():
+    print("鼠标自动移动脚本已启动")
+    print("按 Ctrl+C 停止运行")
+
+    try:
+        while True:
+            simulate_mouse()
+
+            print(
+                datetime.now().strftime("%H:%M:%S"),
+                "鼠标移动完成"
+            )
+
+            time.sleep(INTERVAL)
+
+    except KeyboardInterrupt:
+        print("脚本已停止")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
 
 import ctypes
 import time
